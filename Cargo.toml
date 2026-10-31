@@ -1,0 +1,49 @@
+[package]
+name = "dvpn"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Decentralised peer-to-peer VPN"
+
+[[bin]]
+name = "dvpn"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+futures = "0.3.34"
+ipnet = "2.12.2"
+libp2p = { version = "0.57.1", features = [
+    "tokio",
+    "tcp",
+    "quic",
+    "noise",
+    "yamux",
+    "kad",
+    "mdns",
+    "identify",
+    "ping",
+    "autonat",
+    "dcutr",
+    "relay",
+    "macros",
+    "ed25519",
+] }
+libp2p-stream = "0.5.0-alpha"
+postcard = { version = "1.1.3", features = ["use-std"] }
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+snow = "0.10.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+tun-rs = { version = "2.8.16", features = ["async"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zeroize = "1.9.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
