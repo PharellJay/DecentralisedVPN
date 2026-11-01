@@ -3,11 +3,16 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dvpn::circuit::ExitSession;
+use dvpn::device::PacketDevice;
+use dvpn::exit::{self, ExitOptions};
+use dvpn::policy::ExitPolicy;
 use dvpn::identity::Identity;
 use dvpn::node::{self, ExitConfig, NodeConfig, NodeHandle, Reachability};
+use dvpn::records::ExitKind;
 use libp2p::Multiaddr;
 use libp2p::multiaddr::Protocol;
 use tempfile::TempDir;
@@ -20,6 +25,7 @@ pub struct Opts {
     pub reachability: Reachability,
     pub relay: bool,
     pub exit: bool,
+    pub exit_kind: ExitKind,
     /// Listen on 127.0.0.1; `false` simulates a node behind NAT (outbound only).
     pub listen: bool,
 }
@@ -31,6 +37,7 @@ impl Default for Opts {
             reachability: Reachability::Public,
             relay: false,
             exit: false,
+            exit_kind: ExitKind::Dedicated,
             listen: true,
         }
     }
@@ -72,6 +79,7 @@ pub async fn start_in(tmp: &Path, opts: Opts) -> TestNode {
             relay: opts.relay,
             relay_rate_mbps: 0,
             exit: opts.exit.then(|| ExitConfig {
+                kind: opts.exit_kind,
                 max_sessions: 16,
                 blocked_tcp_ports: vec![25],
             }),
@@ -99,6 +107,29 @@ pub async fn start_in(tmp: &Path, opts: Opts) -> TestNode {
         data_dir: dir,
         _tmp: None,
     }
+}
+
+/// A packet device with no traffic.
+pub struct IdleDevice;
+
+impl PacketDevice for IdleDevice {
+    async fn recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        std::future::pending().await
+    }
+    async fn send(&self, packet: &[u8]) -> std::io::Result<usize> {
+        Ok(packet.len())
+    }
+}
+
+/// Runs the real exit forwarder for `node`'s sessions on an idle device, so its
+/// sessions behave like a real exit's (e.g. keepalives are answered).
+pub fn run_exit_forwarder(node: &mut TestNode) {
+    let options = Arc::new(ExitOptions {
+        policy: ExitPolicy::new(std::iter::empty(), vec![25]),
+        rate_mbps: 0,
+    });
+    let sessions = node.exit_sessions.take().expect("not an exit");
+    tokio::spawn(exit::forward(Arc::new(IdleDevice), sessions, options, Arc::default()));
 }
 
 /// Polls `check` until it returns `Some`, panicking after [`TIMEOUT`].

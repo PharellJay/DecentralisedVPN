@@ -9,7 +9,7 @@
 //! See docs/DESIGN.md §3.4.
 
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +23,7 @@ use tokio::time::timeout;
 use tracing::debug;
 use zeroize::Zeroizing;
 
+use crate::addrs;
 use crate::framing::{MAX_FRAME, MAX_PADDED_PACKET, pad, read_frame, unpad, write_frame};
 use crate::identity::NOISE_PARAMS;
 use crate::node::NodeHandle;
@@ -267,7 +268,7 @@ pub async fn open_via_relay(
         .await
         .map_err(|e| match e {
             libp2p_stream::OpenStreamError::UnsupportedProtocol(_) => CircuitError::RelayRefused,
-            other => CircuitError::RelayUnreachable(other.to_string()),
+            other => CircuitError::RelayUnreachable(addrs::redact(&other.to_string())),
         })?;
 
     let request = SpliceRequest {
@@ -291,7 +292,12 @@ pub async fn open_via_relay(
 }
 
 /// Relay: accepts splice requests and pipes them to the requested exit.
-pub(crate) async fn serve_splices(handle: NodeHandle, mut incoming: libp2p_stream::IncomingStreams, rate_mbps: u64) {
+pub(crate) async fn serve_splices(
+    handle: NodeHandle,
+    mut incoming: libp2p_stream::IncomingStreams,
+    rate_mbps: u64,
+    allow_private: bool,
+) {
     let slots = Arc::new(Semaphore::new(MAX_SPLICES));
     while let Some((from, stream)) = incoming.next().await {
         let Ok(slot) = slots.clone().try_acquire_owned() else {
@@ -301,14 +307,20 @@ pub(crate) async fn serve_splices(handle: NodeHandle, mut incoming: libp2p_strea
         let handle = handle.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) = splice(&handle, from, stream, rate_mbps).await {
+            if let Err(e) = splice(&handle, from, stream, rate_mbps, allow_private).await {
                 debug!("splice ended: {e:#}");
             }
         });
     }
 }
 
-async fn splice(handle: &NodeHandle, from: PeerId, mut client: libp2p::Stream, rate_mbps: u64) -> anyhow::Result<()> {
+async fn splice(
+    handle: &NodeHandle,
+    from: PeerId,
+    mut client: libp2p::Stream,
+    rate_mbps: u64,
+    allow_private: bool,
+) -> anyhow::Result<()> {
     let request = timeout(HANDSHAKE_TIMEOUT, read_frame(&mut client))
         .await??
         .ok_or_else(|| anyhow::anyhow!("closed before request"))?;
@@ -318,12 +330,7 @@ async fn splice(handle: &NodeHandle, from: PeerId, mut client: libp2p::Stream, r
         write_frame(&mut client, &[SPLICE_REFUSED]).await?;
         anyhow::bail!("refused splice to the requester or to ourselves");
     }
-    let addrs: Vec<Multiaddr> = request
-        .addrs
-        .into_iter()
-        .take(MAX_RECORD_ADDRS)
-        .filter_map(|a| Multiaddr::try_from(a).ok())
-        .collect();
+    let addrs = splice_addrs(request.addrs, allow_private);
 
     let connect = async {
         if !addrs.is_empty() {
@@ -342,6 +349,17 @@ async fn splice(handle: &NodeHandle, from: PeerId, mut client: libp2p::Stream, r
     write_frame(&mut client, &[SPLICE_OK]).await?;
     pipe(client, exit_stream, rate_mbps).await;
     Ok(())
+}
+
+/// The exit addresses from a splice request that this relay is willing to dial. The
+/// request comes from an untrusted client, so loopback and LAN addresses are dropped
+/// (unless the network is LAN-only).
+fn splice_addrs(raw: Vec<Vec<u8>>, allow_private: bool) -> Vec<Multiaddr> {
+    raw.into_iter()
+        .take(MAX_RECORD_ADDRS)
+        .filter_map(|a| Multiaddr::try_from(a).ok())
+        .filter(|a| addrs::is_dialable_for_others(a, allow_private))
+        .collect()
 }
 
 /// Copies bytes both ways (rate-limited) until either side closes, then closes both.
@@ -388,14 +406,19 @@ pub(crate) async fn serve_exit(
     mut incoming: libp2p_stream::IncomingStreams,
     static_private: Zeroizing<Vec<u8>>,
     max_sessions: usize,
+    pool: IpPool,
     sessions: mpsc::Sender<ExitSession>,
 ) {
     let slots = Arc::new(Semaphore::new(max_sessions));
-    let pool = IpPool::default();
+    let per_relay = RelayQuota::new(per_relay_limit(max_sessions));
     let static_private = Arc::new(static_private);
     while let Some((via_peer, stream)) = incoming.next().await {
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             debug!("exit session limit reached; dropping request");
+            continue;
+        };
+        let Some(ticket) = per_relay.acquire(via_peer) else {
+            debug!("too many sessions through one relay; dropping request");
             continue;
         };
         let Some(lease) = pool.lease() else {
@@ -406,7 +429,7 @@ pub(crate) async fn serve_exit(
         let sessions = sessions.clone();
         tokio::spawn(async move {
             let ip = lease.ip;
-            let guard: Guard = Arc::new((lease, slot));
+            let guard: Guard = Arc::new((lease, slot, ticket));
             match timeout(HANDSHAKE_TIMEOUT, exit_handshake(stream, &key, ip, Some(guard))).await {
                 Ok(Ok(tunnel)) => {
                     let _ = sessions.send(ExitSession { via_peer, tunnel }).await;
@@ -418,10 +441,73 @@ pub(crate) async fn serve_exit(
     }
 }
 
+/// Sessions allowed through one relay. Exits can't tell clients apart (that's the point),
+/// but they can stop a single relay, and so a single client, from taking every slot.
+fn per_relay_limit(max_sessions: usize) -> usize {
+    (max_sessions / 4).max(2)
+}
+
+/// Counts sessions per relay; a [`RelayTicket`] gives its place back when dropped.
+#[derive(Clone)]
+struct RelayQuota {
+    limit: usize,
+    counts: Arc<Mutex<HashMap<PeerId, usize>>>,
+}
+
+struct RelayTicket {
+    relay: PeerId,
+    quota: RelayQuota,
+}
+
+impl RelayQuota {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            counts: Arc::default(),
+        }
+    }
+
+    fn acquire(&self, relay: PeerId) -> Option<RelayTicket> {
+        let mut counts = self.counts.lock().expect("quota lock");
+        let count = counts.entry(relay).or_default();
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(RelayTicket {
+            relay,
+            quota: self.clone(),
+        })
+    }
+}
+
+impl Drop for RelayTicket {
+    fn drop(&mut self) {
+        let mut counts = self.quota.counts.lock().expect("quota lock");
+        if let Some(count) = counts.get_mut(&self.relay) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.relay);
+            }
+        }
+    }
+}
+
 /// Allocates unique virtual IPs; an address returns to the pool when its lease drops.
+///
+/// Every exit uses the same range, so a machine that is both a client and an exit could
+/// be handed its own tunnel address by a remote exit and also lease it locally. Leases
+/// start at a random point to make that rare, the client's own address can be
+/// [reserved](Self::reserve), and the client checks [`Self::is_leased`] for the rest.
 #[derive(Clone, Default)]
 pub struct IpPool {
-    used: Arc<Mutex<BTreeSet<u32>>>,
+    state: Arc<Mutex<PoolState>>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    used: BTreeSet<u32>,
+    reserved: Option<u32>,
 }
 
 pub struct IpLease {
@@ -431,19 +517,35 @@ pub struct IpLease {
 
 impl IpPool {
     pub fn lease(&self) -> Option<IpLease> {
-        let mut used = self.used.lock().expect("pool lock");
-        let free = (POOL_FIRST..=POOL_LAST).find(|ip| !used.contains(ip))?;
-        used.insert(free);
+        self.lease_from(rand::random_range(POOL_FIRST..=POOL_LAST))
+    }
+
+    /// The first free address at or after `start`, wrapping around.
+    fn lease_from(&self, start: u32) -> Option<IpLease> {
+        let mut state = self.state.lock().expect("pool lock");
+        let free = (start..=POOL_LAST)
+            .chain(POOL_FIRST..start)
+            .find(|ip| !state.used.contains(ip) && state.reserved != Some(*ip))?;
+        state.used.insert(free);
         Some(IpLease {
             ip: Ipv4Addr::from(free),
             pool: self.clone(),
         })
     }
+
+    /// Keeps `ip` (this machine's own tunnel address) out of new leases.
+    pub fn reserve(&self, ip: Option<Ipv4Addr>) {
+        self.state.lock().expect("pool lock").reserved = ip.map(u32::from);
+    }
+
+    pub fn is_leased(&self, ip: Ipv4Addr) -> bool {
+        self.state.lock().expect("pool lock").used.contains(&u32::from(ip))
+    }
 }
 
 impl Drop for IpLease {
     fn drop(&mut self) {
-        self.pool.used.lock().expect("pool lock").remove(&u32::from(self.ip));
+        self.pool.state.lock().expect("pool lock").used.remove(&u32::from(self.ip));
     }
 }
 
@@ -452,13 +554,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pool_hands_out_unique_addresses_and_reuses_released_ones() {
+    fn one_relay_cannot_take_every_exit_session() {
+        assert_eq!(per_relay_limit(16), 4);
+        assert_eq!(per_relay_limit(64), 16);
+        assert_eq!(per_relay_limit(3), 2, "small exits still allow some sharing of a relay");
+
+        let quota = RelayQuota::new(2);
+        let (busy, other) = (PeerId::random(), PeerId::random());
+        let first = quota.acquire(busy).unwrap();
+        let _second = quota.acquire(busy).unwrap();
+        assert!(quota.acquire(busy).is_none(), "third session through the same relay");
+        assert!(quota.acquire(other).is_some(), "other relays are unaffected");
+        drop(first);
+        assert!(quota.acquire(busy).is_some(), "a closed session frees its place");
+    }
+
+    #[test]
+    fn relays_ignore_internal_addresses_in_splice_requests() {
+        let raw = |addrs: &[&str]| addrs.iter().map(|a| a.parse::<Multiaddr>().unwrap().to_vec()).collect::<Vec<_>>();
+        let request = raw(&["/ip4/127.0.0.1/tcp/22", "/ip4/192.168.1.1/tcp/80", "/ip4/203.0.114.9/tcp/4001"]);
+        let dialed = splice_addrs(request.clone(), false);
+        assert_eq!(dialed, ["/ip4/203.0.114.9/tcp/4001".parse::<Multiaddr>().unwrap()]);
+        assert_eq!(splice_addrs(request, true).len(), 3, "LAN-only networks keep private addresses");
+        assert!(splice_addrs(vec![b"garbage".to_vec()], true).is_empty());
+    }
+
+    fn in_pool(ip: Ipv4Addr) -> bool {
+        (POOL_FIRST..=POOL_LAST).contains(&u32::from(ip))
+    }
+
+    #[test]
+    fn pool_hands_out_unique_addresses_and_releases_them() {
         let pool = IpPool::default();
-        let a = pool.lease().unwrap();
-        let b = pool.lease().unwrap();
-        assert_eq!(a.ip, Ipv4Addr::new(10, 77, 0, 2));
-        assert_eq!(b.ip, Ipv4Addr::new(10, 77, 0, 3));
-        drop(a);
-        assert_eq!(pool.lease().unwrap().ip, Ipv4Addr::new(10, 77, 0, 2));
+        let leases: Vec<IpLease> = (0..100).map(|_| pool.lease().unwrap()).collect();
+        let unique: BTreeSet<Ipv4Addr> = leases.iter().map(|l| l.ip).collect();
+        assert_eq!(unique.len(), leases.len());
+        assert!(unique.iter().all(|&ip| in_pool(ip)));
+
+        let ip = leases[0].ip;
+        assert!(pool.is_leased(ip));
+        drop(leases);
+        assert!(!pool.is_leased(ip));
+    }
+
+    #[test]
+    fn pool_starts_at_random_addresses() {
+        // Two independent exits must not both start at 10.77.0.2.
+        let firsts: BTreeSet<Ipv4Addr> = (0..20).map(|_| IpPool::default().lease().unwrap().ip).collect();
+        assert!(firsts.len() > 1, "every pool started at {firsts:?}");
+    }
+
+    #[test]
+    fn pool_never_leases_the_reserved_address() {
+        let pool = IpPool::default();
+        let own = Ipv4Addr::new(10, 77, 3, 9);
+        pool.reserve(Some(own));
+        let next = pool.lease_from(u32::from(own)).unwrap();
+        assert_eq!(next.ip, Ipv4Addr::new(10, 77, 3, 10), "reserved address was leased");
+        // Scanning wraps around at the end of the range.
+        let last = pool.lease_from(POOL_LAST).unwrap();
+        assert_eq!(u32::from(last.ip), POOL_LAST);
+        assert_eq!(u32::from(pool.lease_from(POOL_LAST).unwrap().ip), POOL_FIRST);
+        pool.reserve(None);
+        assert_eq!(pool.lease_from(u32::from(own)).unwrap().ip, own);
     }
 }

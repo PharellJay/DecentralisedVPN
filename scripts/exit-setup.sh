@@ -4,7 +4,9 @@
 #   - NATs the exit's client pool (10.77.0.0/16) out of <wan-interface>,
 #   - lets client traffic leave only through <wan-interface>, never to private ranges
 #     or SMTP, and never to services on this host.
-# The dvpn binary itself never changes firewall rules. Run as root.
+# dvpn applies these same rules itself when lending starts (src/lend.rs) and removes
+# them when it stops, so you don't need this script to run an exit. It's here to review
+# or apply the rules by hand; dvpn refuses to start while this table exists. Run as root.
 #
 # Usage: sudo scripts/exit-setup.sh <wan-interface>
 set -euo pipefail
@@ -35,6 +37,8 @@ table ip dvpn {
         iifname "$TUN" oifname != "$WAN" drop
         iifname "$TUN" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } drop
         iifname "$TUN" tcp dport 25 drop
+        oifname "$TUN" ct state established,related accept
+        oifname "$TUN" drop
     }
     chain input {
         type filter hook input priority filter; policy accept;

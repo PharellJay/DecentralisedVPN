@@ -19,7 +19,7 @@ pub const EXIT_PROVIDER_KEY: &[u8] = b"/dvpn/exit/v1";
 pub const RELAY_PROVIDER_KEY: &[u8] = b"/dvpn/relay/v1";
 const EXIT_RECORD_PREFIX: &str = "/dvpn/exit-record/v1/";
 const DOMAIN: &str = "dvpn-exit-record";
-const PAYLOAD_TYPE: &[u8] = b"/dvpn/exit-record/1";
+const PAYLOAD_TYPE: &[u8] = b"/dvpn/exit-record/2";
 
 pub const RECORD_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAX_CLOCK_SKEW: Duration = Duration::from_secs(10 * 60);
@@ -45,6 +45,16 @@ pub enum RecordError {
     TooFarInFuture,
 }
 
+/// What kind of exit a node says it is. Self-declared, so a node can lie; clients use
+/// it only to prefer dedicated exits (docs/DESIGN.md §3.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExitKind {
+    /// `dvpn run --exit`: lends without using the VPN.
+    Dedicated,
+    /// `dvpn connect`: a user lending while connected. Used only when no dedicated exit fits.
+    User,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExitRecord {
     pub peer_id: PeerId,
@@ -53,6 +63,7 @@ pub struct ExitRecord {
     pub addrs: Vec<Multiaddr>,
     /// Exit policy summary: TCP destination ports this exit refuses.
     pub blocked_tcp_ports: Vec<u16>,
+    pub kind: ExitKind,
     /// Unix seconds.
     pub expires_at: u64,
 }
@@ -63,6 +74,7 @@ struct Payload {
     noise_static: [u8; 32],
     addrs: Vec<Vec<u8>>,
     blocked_tcp_ports: Vec<u16>,
+    kind: ExitKind,
     expires_at: u64,
 }
 
@@ -88,6 +100,7 @@ impl ExitRecord {
             noise_static: self.noise_static,
             addrs: self.addrs.iter().take(MAX_RECORD_ADDRS).map(|a| a.to_vec()).collect(),
             blocked_tcp_ports: self.blocked_tcp_ports.iter().take(MAX_BLOCKED_PORTS).copied().collect(),
+            kind: self.kind,
             expires_at: self.expires_at,
         };
         let envelope = SignedEnvelope::new(
@@ -142,6 +155,7 @@ impl ExitRecord {
             noise_static: payload.noise_static,
             addrs,
             blocked_tcp_ports: payload.blocked_tcp_ports,
+            kind: payload.kind,
             expires_at: payload.expires_at,
         })
     }
@@ -157,6 +171,7 @@ mod tests {
             noise_static: [7; 32],
             addrs: vec!["/ip4/203.0.114.9/tcp/4001".parse().unwrap()],
             blocked_tcp_ports: vec![25],
+            kind: ExitKind::Dedicated,
             expires_at,
         }
     }

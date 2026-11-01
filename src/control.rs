@@ -7,7 +7,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, bail};
@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::lend::LendingHandle;
 use crate::node::NodeHandle;
+use crate::select::{ProbeReport, Selection};
 
 const SOCKET_FILE: &str = "control.sock";
 /// `sun_path` is 108 bytes on Linux, including the terminating NUL.
@@ -25,9 +27,25 @@ const MAX_SOCKET_PATH: usize = 107;
 pub struct CircuitReport {
     pub relay: String,
     pub exit: String,
+    /// The exit is another user lending while connected (used only when no dedicated exit fits).
+    pub exit_is_user: bool,
     pub assigned_ip: String,
     /// Unix seconds.
     pub connected_since: u64,
+}
+
+/// Where `dvpn connect` is. Every phase but `Connected` blocks traffic once routes exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    #[default]
+    Idle,
+    /// Our own exit isn't usable by others yet; no circuit is built until it is.
+    WaitingForLending,
+    Connecting,
+    Connected,
+    Reconnecting,
+    /// Lending has been down too long; the circuit is closed and traffic blocked.
+    Paused,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,15 +57,46 @@ pub struct StatusReport {
     pub hole_punches: usize,
     /// `dvpn connect`: the current circuit, or `None` while (re)connecting.
     pub circuit: Option<CircuitReport>,
-    /// `dvpn run --exit`: active exit sessions.
+    pub phase: Phase,
+    /// The kill switch is in place: traffic either goes through the tunnel or nowhere.
+    /// False until the first circuit is up, while traffic still goes out normally.
+    pub protected: bool,
+    /// Problems that weaken protection (e.g. DNS not going through the tunnel).
+    pub warnings: Vec<String>,
+    pub last_error: Option<String>,
+    /// How exits are chosen: "random" or "max ping N ms".
+    pub selection: String,
+    /// The last max-ping search, if any.
+    pub probe: Option<ProbeReport>,
+    /// When lending: active exit sessions.
     pub exit_sessions: Option<usize>,
+    pub exit_published: bool,
+    /// When lending: whether others can use our exit right now.
+    pub lending_ready: Option<bool>,
 }
 
 /// State shared between the running command and the status socket.
 #[derive(Clone, Default)]
 pub struct SharedState {
     pub circuit: Arc<Mutex<Option<CircuitReport>>>,
-    pub exit_sessions: Option<Arc<AtomicUsize>>,
+    pub phase: Arc<Mutex<Phase>>,
+    pub last_error: Arc<Mutex<Option<String>>>,
+    pub protected: Arc<AtomicBool>,
+    pub warnings: Arc<Mutex<Vec<String>>>,
+    pub lending: Option<LendingHandle>,
+    /// Read before every circuit attempt, so it can be changed while running.
+    pub selection: Arc<Mutex<Selection>>,
+    pub probe: Arc<Mutex<Option<ProbeReport>>>,
+}
+
+impl SharedState {
+    pub fn set_phase(&self, phase: Phase) {
+        *self.phase.lock().expect("state lock") = phase;
+    }
+
+    pub fn set_error(&self, error: Option<String>) {
+        *self.last_error.lock().expect("state lock") = error;
+    }
 }
 
 pub fn socket_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -82,9 +131,9 @@ pub async fn bind(data_dir: &Path) -> anyhow::Result<UnixListener> {
 
 pub async fn serve(listener: UnixListener, handle: NodeHandle, state: SharedState) {
     while let Ok((mut stream, _)) = listener.accept().await {
-        let report = match report(&handle, &state).await {
-            Ok(report) => report,
-            Err(_) => return,
+        // A failed report (e.g. the node is shutting down) skips this request only.
+        let Ok(report) = report(&handle, &state).await else {
+            continue;
         };
         let mut json = serde_json::to_vec(&report).expect("serializable");
         json.push(b'\n');
@@ -101,7 +150,15 @@ async fn report(handle: &NodeHandle, state: &SharedState) -> anyhow::Result<Stat
         routing_peers: handle.routing_peers().await?.len(),
         hole_punches: status.hole_punches,
         circuit: state.circuit.lock().expect("state lock").clone(),
-        exit_sessions: state.exit_sessions.as_ref().map(|n| n.load(Ordering::Relaxed)),
+        phase: *state.phase.lock().expect("state lock"),
+        protected: state.protected.load(Ordering::Relaxed),
+        warnings: state.warnings.lock().expect("state lock").clone(),
+        last_error: state.last_error.lock().expect("state lock").clone(),
+        selection: state.selection.lock().expect("state lock").to_string(),
+        probe: state.probe.lock().expect("state lock").clone(),
+        exit_sessions: state.lending.as_ref().map(|l| l.active.load(Ordering::Relaxed)),
+        exit_published: status.exit_published,
+        lending_ready: state.lending.as_ref().map(|l| l.ready(&status)),
     })
 }
 

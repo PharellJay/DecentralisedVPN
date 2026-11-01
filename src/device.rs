@@ -30,8 +30,12 @@ impl TunDevice {
         Ok(Self(device))
     }
 
-    pub fn set_address(&self, addr: Ipv4Addr, prefix: u8) -> io::Result<()> {
-        self.0.set_network_address(addr, prefix, None)
+    /// Swaps the device's IPv4 address without ever leaving it with none: Linux deletes
+    /// every route through a device that loses its last IPv4 address, which would
+    /// silently remove the client's kill-switch routes.
+    pub fn replace_address(&self, old: Ipv4Addr, new: Ipv4Addr, prefix: u8) -> io::Result<()> {
+        self.0.add_address_v4(new, prefix)?;
+        self.0.remove_address(old.into())
     }
 }
 

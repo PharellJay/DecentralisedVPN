@@ -1,20 +1,50 @@
-//! Thin wrappers around `ip` (iproute2). Route and address changes need root.
+//! Thin wrappers around `ip` (iproute2) and `nft`. Route, rule and address changes need root.
 
+use std::io::Write;
 use std::net::Ipv4Addr;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
 use ipnet::Ipv4Net;
 
 pub fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new(program)
+    run_with_stdin(program, args, None)
+}
+
+/// Like [`run`], feeding `stdin` to the program (e.g. a ruleset to `nft -f -`).
+pub fn run_with_stdin(program: &str, args: &[&str], stdin: Option<&str>) -> anyhow::Result<String> {
+    let mut child = Command::new(program)
         .args(args)
-        .output()
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("could not run {program}"))?;
+    if let Some(input) = stdin {
+        child.stdin.take().expect("piped stdin").write_all(input.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
     if !out.status.success() {
         bail!("`{program} {}` failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Completes on SIGINT, SIGTERM or SIGHUP (e.g. the terminal window closing), so every
+/// command can undo its routes and firewall rules instead of being killed mid-way.
+/// The handlers are installed when this is called, not when it's first polled.
+pub fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+    })
 }
 
 /// Next hop of a route: an optional gateway and the outgoing device.

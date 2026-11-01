@@ -27,12 +27,12 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::addrs;
-use crate::circuit::{self, CircuitError, EXIT_PROTOCOL, ExitSession, SPLICE_PROTOCOL, Tunnel};
+use crate::circuit::{self, CircuitError, EXIT_PROTOCOL, ExitSession, IpPool, SPLICE_PROTOCOL, Tunnel};
 use crate::config::split_peer_addr;
 use crate::guard;
 use crate::identity::Identity;
 use crate::peer_cache;
-use crate::records::{self, ExitRecord, EXIT_PROVIDER_KEY, RECORD_LIFETIME, RELAY_PROVIDER_KEY};
+use crate::records::{self, EXIT_PROVIDER_KEY, ExitKind, ExitRecord, RECORD_LIFETIME, RELAY_PROVIDER_KEY};
 
 pub const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/dvpn/kad/1.0.0");
 const IDENTIFY_PROTOCOL: &str = "/dvpn/id/1.0.0";
@@ -74,6 +74,8 @@ impl FromStr for Reachability {
 
 pub struct ExitConfig {
     pub max_sessions: usize,
+    /// Advertised in the exit record, so clients can prefer dedicated exits.
+    pub kind: ExitKind,
     /// Advertised in the exit record; enforced by [`crate::policy::ExitPolicy`].
     pub blocked_tcp_ports: Vec<u16>,
 }
@@ -111,6 +113,10 @@ pub struct NodeStatus {
     pub external_addrs: Vec<Multiaddr>,
     /// Successful DCUtR hole punches since start.
     pub hole_punches: usize,
+    /// Reachable without a relay: configured public, or confirmed by AutoNAT.
+    pub publicly_reachable: bool,
+    /// Our exit record was published and is still valid.
+    pub exit_published: bool,
 }
 
 /// An open client circuit.
@@ -125,6 +131,8 @@ pub struct Node {
     pub task: JoinHandle<anyhow::Result<()>>,
     /// Present when [`NodeConfig::exit`] is set.
     pub exit_sessions: Option<mpsc::Receiver<ExitSession>>,
+    /// The exit's virtual address pool, when [`NodeConfig::exit`] is set.
+    pub exit_pool: Option<IpPool>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -375,16 +383,22 @@ pub fn spawn(identity: Identity, config: NodeConfig) -> anyhow::Result<Node> {
 
     if config.relay {
         let incoming = control.accept(SPLICE_PROTOCOL).map_err(|_| anyhow!("splice protocol already registered"))?;
-        tokio::spawn(circuit::serve_splices(handle.clone(), incoming, config.relay_rate_mbps));
+        tokio::spawn(circuit::serve_splices(
+            handle.clone(),
+            incoming,
+            config.relay_rate_mbps,
+            config.allow_private_addrs,
+        ));
     }
-    let exit_sessions = match &config.exit {
+    let (exit_sessions, exit_pool) = match &config.exit {
         Some(exit) => {
             let incoming = control.accept(EXIT_PROTOCOL).map_err(|_| anyhow!("exit protocol already registered"))?;
             let (sessions_tx, sessions_rx) = mpsc::channel(exit.max_sessions.max(1));
-            tokio::spawn(circuit::serve_exit(incoming, exit_private, exit.max_sessions, sessions_tx));
-            Some(sessions_rx)
+            let pool = IpPool::default();
+            tokio::spawn(circuit::serve_exit(incoming, exit_private, exit.max_sessions, pool.clone(), sessions_tx));
+            (Some(sessions_rx), Some(pool))
         }
-        None => None,
+        None => (None, None),
     };
 
     let driver = Driver {
@@ -409,6 +423,7 @@ pub fn spawn(identity: Identity, config: NodeConfig) -> anyhow::Result<Node> {
         handle,
         task,
         exit_sessions,
+        exit_pool,
     })
 }
 
@@ -549,6 +564,11 @@ impl Driver {
                     relay_reservations: self.relay_listeners.values().filter(|(_, ok)| *ok).count(),
                     external_addrs: self.swarm.external_addresses().cloned().collect(),
                     hole_punches: self.hole_punches,
+                    publicly_reachable: self.reachable_publicly(),
+                    exit_published: self
+                        .exit_published
+                        .as_ref()
+                        .is_some_and(|(at, _)| at.elapsed() < RECORD_LIFETIME),
                 });
             }
             Command::Dial {
@@ -572,7 +592,7 @@ impl Driver {
                         let _ = reply.send(Err("already connected or dialing".into()));
                     }
                     Err(e) => {
-                        let _ = reply.send(Err(e.to_string()));
+                        let _ = reply.send(Err(addrs::redact(&e.to_string())));
                     }
                 }
             }
@@ -591,10 +611,12 @@ impl Driver {
     fn on_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                // Relay circuit listen addresses already end in /p2p/<us>.
-                match address.iter().last() {
-                    Some(Protocol::P2p(_)) => info!("listening on {address}"),
-                    _ => info!("listening on {address}/p2p/{}", self.swarm.local_peer_id()),
+                // Our own addresses are fine to show; a relay circuit address contains
+                // the relay's IP, which is redacted. Circuit addresses already end in /p2p/<us>.
+                if addrs::is_circuit(&address) {
+                    info!("listening on {}", addrs::redact(&address.to_string()));
+                } else {
+                    info!("listening on {address}/p2p/{}", self.swarm.local_peer_id());
                 }
                 // The operator declared this node reachable, so its usable listen
                 // addresses are external addresses (this also enables the relay server).
@@ -648,12 +670,16 @@ impl Driver {
                 connection_id, error, ..
             } => {
                 if let Some(reply) = self.pending_dials.remove(&connection_id) {
-                    let _ = reply.send(Err(error.to_string()));
+                    let _ = reply.send(Err(addrs::redact(&error.to_string())));
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                 if info.protocols.contains(&KAD_PROTOCOL) {
-                    for addr in info.listen_addrs.iter().take(MAX_IDENTIFY_ADDRS) {
+                    // A peer chooses what it advertises; loopback or LAN addresses would
+                    // make others dial their own machines and networks.
+                    let allow_private = self.config.allow_private_addrs;
+                    let usable = info.listen_addrs.iter().filter(|a| addrs::is_dialable_for_others(a, allow_private));
+                    for addr in usable.take(MAX_IDENTIFY_ADDRS) {
                         self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                     }
                 }
@@ -830,7 +856,7 @@ impl Driver {
                     self.relay_listeners.insert(relay, (id, false));
                 }
                 Err(e) => {
-                    debug!(relay = %relay, "relay listen failed: {e}");
+                    debug!(relay = %relay, "relay listen failed: {}", addrs::redact(&e.to_string()));
                     self.failed_relays.insert(relay, Instant::now());
                 }
             }
@@ -871,6 +897,7 @@ impl Driver {
 
         if let Some(exit) = &self.config.exit {
             let blocked_tcp_ports = exit.blocked_tcp_ports.clone();
+            let kind = exit.kind;
             let addrs = self.advertised_addrs();
             let due = match &self.exit_published {
                 None => true,
@@ -882,6 +909,7 @@ impl Driver {
                     noise_static: self.noise_public,
                     addrs: addrs.clone(),
                     blocked_tcp_ports,
+                    kind,
                     expires_at: records::now_secs() + RECORD_LIFETIME.as_secs(),
                 };
                 match record.sign(&self.keypair) {

@@ -1,9 +1,14 @@
 //! `dvpn connect`: builds a circuit, brings up the TUN device and routes, forwards
 //! packets, and rebuilds the circuit when it fails. Routes stay in place while
 //! reconnecting, so traffic is blocked rather than leaked (kill switch).
+//!
+//! Using the network requires lending to it (docs/DESIGN.md §3.9): no circuit is built
+//! until our own exit is usable by others, and the circuit is closed (traffic blocked)
+//! if lending stays down for [`LENDING_GRACE`].
 
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,19 +19,28 @@ use tracing::{info, warn};
 
 use crate::addrs::{self, is_circuit};
 use crate::circuit::{CircuitError, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, Tunnel};
-use crate::control::{CircuitReport, SharedState};
+use crate::control::{CircuitReport, Phase, SharedState};
 use crate::device::{PacketDevice, TunDevice};
+use crate::lend::LendingHandle;
 use crate::node::{Circuit, NodeHandle};
 use crate::packet;
-use crate::records::{ExitRecord, now_secs};
+use crate::records::{ExitKind, ExitRecord, now_secs};
 use crate::routes::RouteGuard;
+use crate::select::{self, Prepare};
 
 const PEER_WAIT: Duration = Duration::from_secs(30);
 const DISCOVERY_WAIT: Duration = Duration::from_secs(60);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_EXEMPT_ADDRS: usize = 4;
+const LENDING_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a client on another user's exit looks for a dedicated one.
+const DEDICATED_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// How long lending may be down while connected before the circuit is closed. Short
+/// outages (an AutoNAT re-check, a relay reservation being renewed) don't interrupt.
+pub const LENDING_GRACE: Duration = Duration::from_secs(120);
 
+#[derive(Clone)]
 pub struct ConnectOptions {
     pub tun_name: String,
     /// DNS server to use through the tunnel (via systemd-resolved); `None` leaves DNS alone.
@@ -40,45 +54,171 @@ struct Candidates {
     relays: Vec<PeerId>,
 }
 
-/// Runs until the device fails or the future is dropped (which restores routing).
-pub async fn run(handle: NodeHandle, options: ConnectOptions, state: SharedState) -> anyhow::Result<()> {
-    wait_for_peers(&handle).await?;
-    let candidates = Arc::new(Mutex::new(discover(&handle).await?));
+/// Marks the kill switch as in place for as long as it lives (also when the client
+/// future is dropped, e.g. on disconnect).
+struct Protected(SharedState);
 
-    let mut circuit = first_circuit(&handle, &candidates).await?;
+impl Protected {
+    fn set(state: &SharedState) -> Self {
+        state.protected.store(true, Ordering::Relaxed);
+        Self(state.clone())
+    }
+}
+
+impl Drop for Protected {
+    fn drop(&mut self) {
+        self.0.protected.store(false, Ordering::Relaxed);
+        self.0.warnings.lock().expect("state lock").clear();
+    }
+}
+
+enum Interruption {
+    CircuitLost(anyhow::Error),
+    LendingDown,
+    /// We were on another user's exit and a dedicated one is now up (make-before-break).
+    DedicatedExitUp(Circuit),
+}
+
+/// Runs until the device fails or the future is dropped (which restores routing).
+/// `state.lending` must be set: connecting without lending is refused.
+pub async fn run(handle: NodeHandle, options: ConnectOptions, state: SharedState) -> anyhow::Result<()> {
+    let lending = state.lending.clone().context("connecting requires lending, but no exit is running")?;
+    wait_for_peers(&handle).await?;
+    state.set_phase(Phase::WaitingForLending);
+    wait_for_lending(&handle, &lending).await;
+
+    state.set_phase(Phase::Connecting);
+    let candidates = Arc::new(Mutex::new(discover(&handle).await?));
+    let mut circuit = first_circuit(&handle, &candidates, &lending, &state).await?;
     let mut assigned_ip = circuit.tunnel.assigned_ip;
     let device = TunDevice::create(&options.tun_name, assigned_ip, 32, circuit.tunnel.mtu)
         .with_context(|| format!("creating TUN device {}", options.tun_name))?;
 
-    let mut routes = RouteGuard::install(&options.tun_name, options.dns)?;
+    // Locked only briefly and never across an await: test circuits exempt relays in parallel.
+    let routes = RouteGuard::install(&options.tun_name, options.dns)?;
+    *state.warnings.lock().expect("state lock") = routes.warnings.clone();
+    let routes = Mutex::new(routes);
+    // Declared after `routes`, so it drops (reporting "unprotected") before they go.
+    let _protected = Protected::set(&state);
     let connected = handle.connected_addrs(circuit.relay).await?;
     let relay_ips = direct_ipv4s(&connected);
     if relay_ips.is_empty() {
         bail!("no direct connection to the entry relay; cannot route around the tunnel");
     }
     for ip in relay_ips {
-        routes.exempt(ip)?;
+        routes.lock().expect("routes lock").exempt(ip)?;
     }
 
     // Keep candidates fresh; while connected, these lookups go through the tunnel.
     let refresher = tokio::spawn(refresh(handle.clone(), candidates.clone()));
     let result = loop {
-        publish(&state, Some(&circuit));
-        info!(relay = %circuit.relay, exit = %circuit.exit, "tunnel up");
-        let error = pump(&device, &mut circuit.tunnel).await;
+        let kind = exit_kind(&candidates, circuit.exit);
+        publish(&state, Some((&circuit, kind)));
+        state.set_phase(Phase::Connected);
+        state.set_error(None);
+        info!(relay = %circuit.relay, exit = %circuit.exit, ?kind, "tunnel up");
+        let interruption = tokio::select! {
+            error = pump(&device, &mut circuit.tunnel) => Interruption::CircuitLost(error),
+            () = lending_lost(&handle, &lending) => Interruption::LendingDown,
+            new = dedicated_exit_up(&handle, &routes, &lending, &state), if kind == ExitKind::User => {
+                Interruption::DedicatedExitUp(new)
+            }
+        };
         publish(&state, None);
-        warn!("circuit lost ({error:#}); traffic is blocked until a new circuit is up");
+        let next = match interruption {
+            Interruption::CircuitLost(error) => {
+                warn!("circuit lost ({error:#}); traffic is blocked until a new circuit is up");
+                state.set_error(Some(format!("circuit lost: {error:#}")));
+                None
+            }
+            Interruption::LendingDown => {
+                drop(circuit);
+                warn!("lending has been down for {}s; VPN paused, traffic is blocked until it is back", LENDING_GRACE.as_secs());
+                state.set_phase(Phase::Paused);
+                state.set_error(Some("lending is down: others can't reach your exit".into()));
+                wait_for_lending(&handle, &lending).await;
+                None
+            }
+            Interruption::DedicatedExitUp(new) => {
+                info!("a dedicated exit is available; leaving the exit lent by another user");
+                Some(new)
+            }
+        };
 
-        circuit = reconnect(&handle, &mut routes, &candidates).await;
+        circuit = match next {
+            Some(new) => new,
+            None => {
+                state.set_phase(Phase::Reconnecting);
+                reconnect(&handle, &routes, &candidates, &lending, &state).await
+            }
+        };
         if circuit.tunnel.assigned_ip != assigned_ip {
-            assigned_ip = circuit.tunnel.assigned_ip;
-            if let Err(e) = device.set_address(assigned_ip, 32) {
+            if let Err(e) = device.replace_address(assigned_ip, circuit.tunnel.assigned_ip, 32) {
                 break Err(e).context("updating the TUN address");
             }
+            assigned_ip = circuit.tunnel.assigned_ip;
+        }
+        // Whatever happened to the device meanwhile, the kill switch must still be in place.
+        if let Err(e) = routes.lock().expect("routes lock").reassert() {
+            break Err(e).context("restoring the kill-switch routes");
         }
     };
     refresher.abort();
+    lending.pool.reserve(None);
     result
+}
+
+/// Waits until our exit is usable by others. No timeout: lending is the price of use.
+async fn wait_for_lending(handle: &NodeHandle, lending: &LendingHandle) {
+    let mut announced = false;
+    loop {
+        if lending_ready_now(handle, lending).await {
+            info!("lending is ready: others can use your exit");
+            return;
+        }
+        if !announced {
+            info!("waiting until your exit is published and reachable before connecting");
+            announced = true;
+        }
+        tokio::time::sleep(LENDING_CHECK_INTERVAL).await;
+    }
+}
+
+/// Completes once lending has been down for [`LENDING_GRACE`] without a break.
+async fn lending_lost(handle: &NodeHandle, lending: &LendingHandle) {
+    let mut down_since: Option<Instant> = None;
+    loop {
+        tokio::time::sleep(LENDING_CHECK_INTERVAL).await;
+        if lending_ready_now(handle, lending).await {
+            if down_since.take().is_some() {
+                info!("lending is back");
+            }
+            continue;
+        }
+        match down_since {
+            None => {
+                warn!("lending is down; the VPN pauses in {}s unless it recovers", LENDING_GRACE.as_secs());
+                down_since = Some(Instant::now());
+            }
+            Some(since) if since.elapsed() >= LENDING_GRACE => return,
+            Some(_) => {}
+        }
+    }
+}
+
+async fn lending_ready_now(handle: &NodeHandle, lending: &LendingHandle) -> bool {
+    handle.status().await.is_ok_and(|status| lending.ready(&status))
+}
+
+/// Takes the circuit's address for our own tunnel, unless our exit already leased it
+/// to someone else (both draw from the same range).
+fn claim_address(lending: &LendingHandle, circuit: &Circuit) -> anyhow::Result<()> {
+    let ip = circuit.tunnel.assigned_ip;
+    lending.pool.reserve(Some(ip));
+    if lending.pool.is_leased(ip) {
+        bail!("the exit assigned {ip}, which our own exit is already using; trying another circuit");
+    }
+    Ok(())
 }
 
 async fn wait_for_peers(handle: &NodeHandle) -> anyhow::Result<()> {
@@ -133,13 +273,20 @@ fn update(candidates: &Mutex<Candidates>, exits: Vec<ExitRecord>, relays: Vec<Pe
 /// between attempts: records of exits that went offline stay in the DHT until they
 /// expire, and exits that joined recently may not have been found yet. No routes are
 /// installed yet, so the DHT is reachable directly and nothing can leak.
-async fn first_circuit(handle: &NodeHandle, candidates: &Mutex<Candidates>) -> anyhow::Result<Circuit> {
+async fn first_circuit(
+    handle: &NodeHandle,
+    candidates: &Mutex<Candidates>,
+    lending: &LendingHandle,
+    state: &SharedState,
+) -> anyhow::Result<Circuit> {
     let mut backoff = Duration::from_secs(1);
     loop {
-        let (exits, relays) = snapshot(candidates);
-        match handle.open_circuit_from(exits, relays, |_, _| Ok(())).await {
+        match try_circuit(handle, candidates, lending, state, &|_, _| Ok(())).await {
             Ok(circuit) => return Ok(circuit),
-            Err(e) => warn!("connecting failed ({e:#}); retrying in {}s", backoff.as_secs()),
+            Err(e) => {
+                warn!("connecting failed ({e:#}); retrying in {}s", backoff.as_secs());
+                state.set_error(Some(format!("{e:#}")));
+            }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -154,28 +301,92 @@ fn snapshot(candidates: &Mutex<Candidates>) -> (Vec<ExitRecord>, Vec<PeerId>) {
 
 /// Retries with backoff until a circuit is up. Each candidate relay is routed around
 /// the tunnel first, since the tunnel itself is down.
-async fn reconnect(handle: &NodeHandle, routes: &mut RouteGuard, candidates: &Mutex<Candidates>) -> Circuit {
+async fn reconnect(
+    handle: &NodeHandle,
+    routes: &Mutex<RouteGuard>,
+    candidates: &Mutex<Candidates>,
+    lending: &LendingHandle,
+    state: &SharedState,
+) -> Circuit {
     let mut backoff = Duration::from_secs(1);
     loop {
-        let (exits, relays) = snapshot(candidates);
-        let attempt = handle
-            .open_circuit_from(exits, relays, |_, relay_addrs| {
-                let ips: Vec<Ipv4Addr> = direct_ipv4s(relay_addrs).into_iter().take(MAX_EXEMPT_ADDRS).collect();
-                if ips.is_empty() {
-                    bail!("relay has no direct IPv4 address");
-                }
-                ips.into_iter().try_for_each(|ip| routes.exempt(ip))
-            })
-            .await;
-        match attempt {
+        match try_circuit(handle, candidates, lending, state, &|_, addrs| exempt_relay(routes, addrs)).await {
             Ok(circuit) => return circuit,
             Err(e) => {
                 warn!("reconnect failed ({e:#}); retrying in {}s", backoff.as_secs());
+                state.set_error(Some(format!("{e:#}")));
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
+                // Exits may have joined or left meanwhile.
+                if let (Ok(exits), Ok(relays)) = (handle.find_exits().await, handle.find_relays().await) {
+                    update(candidates, exits, relays);
+                }
             }
         }
     }
+}
+
+/// Routes a candidate relay around the tunnel, which is down or about to be replaced.
+fn exempt_relay(routes: &Mutex<RouteGuard>, relay_addrs: &[Multiaddr]) -> anyhow::Result<()> {
+    let ips: Vec<Ipv4Addr> = direct_ipv4s(relay_addrs).into_iter().take(MAX_EXEMPT_ADDRS).collect();
+    if ips.is_empty() {
+        bail!("relay has no direct IPv4 address");
+    }
+    ips.into_iter().try_for_each(|ip| routes.lock().expect("routes lock").exempt(ip))
+}
+
+/// While on another user's exit: completes with a circuit to a dedicated exit as soon as
+/// one can be built, under the current selection mode. Dedicated exits that are listed
+/// but down just mean we stay where we are.
+async fn dedicated_exit_up(
+    handle: &NodeHandle,
+    routes: &Mutex<RouteGuard>,
+    lending: &LendingHandle,
+    state: &SharedState,
+) -> Circuit {
+    loop {
+        tokio::time::sleep(DEDICATED_CHECK_INTERVAL).await;
+        let (Ok(exits), Ok(relays)) = (handle.find_exits().await, handle.find_relays().await) else {
+            continue;
+        };
+        let (dedicated, _) = select::split_tiers(exits);
+        if dedicated.is_empty() {
+            continue;
+        }
+        let selection = *state.selection.lock().expect("state lock");
+        let (result, _) = select::open(handle, dedicated, relays, selection, &|_, addrs| exempt_relay(routes, addrs)).await;
+        if let Ok(circuit) = result
+            && claim_address(lending, &circuit).is_ok()
+        {
+            return circuit;
+        }
+    }
+}
+
+fn exit_kind(candidates: &Mutex<Candidates>, exit: PeerId) -> ExitKind {
+    let candidates = candidates.lock().expect("candidates lock");
+    // An exit we have no record for can't be told apart; treat it as dedicated.
+    candidates.exits.iter().find(|e| e.peer_id == exit).map_or(ExitKind::Dedicated, |e| e.kind)
+}
+
+/// One attempt at a circuit under the current selection mode, publishing the probe
+/// report for max-ping mode.
+async fn try_circuit(
+    handle: &NodeHandle,
+    candidates: &Mutex<Candidates>,
+    lending: &LendingHandle,
+    state: &SharedState,
+    prepare: Prepare<'_>,
+) -> anyhow::Result<Circuit> {
+    let (exits, relays) = snapshot(candidates);
+    let selection = *state.selection.lock().expect("state lock");
+    let (result, report) = select::open(handle, exits, relays, selection, prepare).await;
+    if report.is_some() {
+        *state.probe.lock().expect("state lock") = report;
+    }
+    let circuit = result?;
+    claim_address(lending, &circuit)?;
+    Ok(circuit)
 }
 
 fn direct_ipv4s(addrs: &[Multiaddr]) -> Vec<Ipv4Addr> {
@@ -193,10 +404,11 @@ fn direct_ipv4s(addrs: &[Multiaddr]) -> Vec<Ipv4Addr> {
     ips
 }
 
-fn publish(state: &SharedState, circuit: Option<&Circuit>) {
-    *state.circuit.lock().expect("state lock") = circuit.map(|c| CircuitReport {
+fn publish(state: &SharedState, circuit: Option<(&Circuit, ExitKind)>) {
+    *state.circuit.lock().expect("state lock") = circuit.map(|(c, kind)| CircuitReport {
         relay: c.relay.to_string(),
         exit: c.exit.to_string(),
+        exit_is_user: kind == ExitKind::User,
         assigned_ip: c.tunnel.assigned_ip.to_string(),
         connected_since: now_secs(),
     });

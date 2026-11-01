@@ -5,7 +5,7 @@ mod common;
 use common::{Opts, TestNode, start, wait_for};
 use dvpn::circuit::CircuitError;
 use dvpn::identity::Identity;
-use dvpn::records::{ExitRecord, now_secs};
+use dvpn::records::{ExitKind, ExitRecord, now_secs};
 
 /// Bootstrap node + one relay + one exit + a client, all bootstrapped off `boot`.
 async fn network() -> (TestNode, TestNode, TestNode, TestNode) {
@@ -89,6 +89,7 @@ async fn node_without_exit_refuses_exit_traffic() {
         noise_static: identity.exit_static.public,
         addrs: not_exit.handle.listen_addrs().await.unwrap(),
         blocked_tcp_ports: vec![],
+        kind: ExitKind::Dedicated,
         expires_at: now_secs() + 600,
     };
     let result = client.handle.open_circuit_via(relay.handle.peer_id(), &target).await;
@@ -118,6 +119,7 @@ async fn relay_refuses_to_splice_back_to_the_client() {
         noise_static: identity.exit_static.public,
         addrs: vec![],
         blocked_tcp_ports: vec![],
+        kind: ExitKind::Dedicated,
         expires_at: now_secs() + 600,
     };
     let result = client.handle.open_circuit_via(relay.handle.peer_id(), &loopback).await;
