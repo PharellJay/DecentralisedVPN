@@ -1,0 +1,2 @@
+# Members of this group may control the dvpn service (connect, disconnect, choose exits).
+g dvpn -

@@ -176,7 +176,7 @@ impl Drop for Lending {
 /// System changes made for lending, undone in reverse order on drop.
 #[derive(Default)]
 struct SystemGuard {
-    undo: Vec<Box<dyn FnOnce() -> anyhow::Result<()> + Send>>,
+    undo: Vec<Box<dyn FnOnce() -> anyhow::Result<()> + Send + Sync>>,
 }
 
 impl SystemGuard {
@@ -252,7 +252,7 @@ impl Drop for SystemGuard {
 /// Removes the firewall table and policy-routing rules a previous dvpn left behind when
 /// it couldn't clean up (killed with SIGKILL, crashed, power loss). Refuses instead if
 /// another dvpn runs in this network namespace, since they may be its.
-fn recover_stale_state() -> anyhow::Result<()> {
+pub fn recover_stale_state() -> anyhow::Result<()> {
     let table = system::run("nft", &["list", "table", "ip", NFT_TABLE]).is_ok();
     let rules = system::run("ip", &["-4", "rule", "show"]).is_ok_and(|out| {
         out.lines()
@@ -278,9 +278,12 @@ fn recover_stale_state() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether another process named `dvpn` shares our network namespace (needs root to
-/// read other processes' namespaces, which lending has).
+/// Whether another root process named `dvpn` shares our network namespace (needs root
+/// to read other processes' namespaces, which lending has). Unprivileged `dvpn`
+/// processes (the dashboard or `dvpn ctl` talking to the service) can't lend, so they
+/// don't count.
 fn other_dvpn_in_this_namespace() -> bool {
+    use std::os::unix::fs::MetadataExt;
     let ours = std::fs::read_link("/proc/self/ns/net").ok();
     let me = std::process::id().to_string();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -291,8 +294,11 @@ fn other_dvpn_in_this_namespace() -> bool {
         let pid = pid.to_string_lossy();
         pid.chars().all(|c| c.is_ascii_digit())
             && pid != me
+            && std::fs::metadata(entry.path()).is_ok_and(|m| m.uid() == 0)
             && std::fs::read_to_string(entry.path().join("comm")).is_ok_and(|c| c.trim() == "dvpn")
-            && std::fs::read_link(entry.path().join("ns/net")).ok() == ours
+            // Unreadable (the sandboxed service lacks CAP_SYS_PTRACE): assume it's here,
+            // rather than remove rules another dvpn may be using.
+            && std::fs::read_link(entry.path().join("ns/net")).map_or(true, |ns| Some(ns) == ours)
     })
 }
 

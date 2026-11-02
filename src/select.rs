@@ -256,7 +256,7 @@ pub async fn measure_exits(
 }
 
 /// How many measured exits fit `limit`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Availability {
     pub dedicated: usize,
     /// Exits lent by other users; used only if `dedicated` is 0.

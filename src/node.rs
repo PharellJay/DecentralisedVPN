@@ -98,7 +98,7 @@ pub struct NodeConfig {
     pub allow_private_addrs: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NatState {
     Unknown,
     Public,

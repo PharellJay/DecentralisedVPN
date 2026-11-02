@@ -1,17 +1,19 @@
-//! `sudo dvpn tui`: a terminal dashboard that lends and connects in one process.
+//! `dvpn tui`: a terminal dashboard to lend, connect and choose exits.
 //!
-//! Lending runs for the whole session; the VPN is started and stopped with keys. The
-//! exit selection mode can be changed at any time, and in max-ping mode the dashboard
-//! shows how many measured exits fit the limit before you connect.
+//! It runs in one of two ways:
+//! - **as a client of the dvpn service** (`dvpn daemon`), when the service is installed:
+//!   no root needed, and closing the dashboard leaves the VPN as it is;
+//! - **in-process** (`sudo dvpn tui`), when it isn't: lending runs for the whole session,
+//!   and quitting disconnects and restores the network.
+//!
+//! Either way the VPN is started and stopped with keys. With the service, lending can also
+//! be started on its own, without connecting. The exit selection mode can be
+//! changed at any time, and in max-ping mode the dashboard shows how many measured exits
+//! fit the limit before you connect.
 //!
 //! Rendering is a pure function of [`View`], so it is tested without a terminal.
 
-use std::collections::VecDeque;
-use std::future::Future;
-use std::io;
 use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -22,123 +24,48 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use tokio::task::JoinHandle;
 use tracing::{info, warn};
-use tracing_subscriber::fmt::MakeWriter;
 
-use crate::client::{self, ConnectOptions};
-use crate::control::{CircuitReport, Phase, SharedState};
+use crate::control::{Client, Phase};
+use crate::controller::{Action, Controller, PING_STEP, View, VpnView, selection_action};
 use crate::install::{self, INSTALL_PATH};
-use crate::lend::{self, LENDING_WARNING, Lending};
-use crate::node::{NatState, Node};
+use crate::lend::{self, LENDING_WARNING};
+use crate::node::NatState;
 use crate::records::now_secs;
-use crate::select::{self, Availability, Measurement, Selection};
+use crate::select::{Availability, Selection};
 use crate::system;
 
 const TICK: Duration = Duration::from_millis(250);
-const LOG_LINES: usize = 500;
-const PING_STEP: Duration = Duration::from_millis(10);
-const MIN_PING: Duration = Duration::from_millis(1);
-const MAX_PING: Duration = Duration::from_secs(60);
-/// The limit offered when switching to max-ping mode for the first time.
-pub const DEFAULT_PING_LIMIT: Duration = Duration::from_millis(100);
 
-/// Everything the TUI drives, started after the user has given consent.
-pub struct Session {
-    pub node: Node,
-    pub lending: Lending,
-    pub state: SharedState,
-    pub options: ConnectOptions,
+/// Where the dashboard's state comes from and its actions go.
+pub enum Backend {
+    /// This process lends and connects itself (needs root).
+    Local(Box<Controller>),
+    /// The dvpn service does, and this process only shows and asks.
+    Service(Client),
 }
 
-/// Recent log lines, written by `tracing` instead of stderr while the TUI is up.
-#[derive(Clone, Default)]
-pub struct LogBuffer(Arc<Mutex<VecDeque<String>>>);
-
-impl LogBuffer {
-    pub fn lines(&self) -> Vec<String> {
-        self.0.lock().expect("log lock").iter().cloned().collect()
+impl Backend {
+    fn is_service(&self) -> bool {
+        matches!(self, Self::Service(_))
     }
-}
 
-pub struct LogWriter {
-    buffer: LogBuffer,
-    pending: Vec<u8>,
-}
-
-impl io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.pending.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for LogWriter {
-    fn drop(&mut self) {
-        let text = String::from_utf8_lossy(&self.pending);
-        let mut lines = self.buffer.0.lock().expect("log lock");
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            lines.push_back(line.trim_end().to_string());
-        }
-        while lines.len() > LOG_LINES {
-            lines.pop_front();
+    async fn act(&mut self, action: Action) -> anyhow::Result<()> {
+        match self {
+            Self::Local(controller) => controller.act(action).await,
+            Self::Service(client) => client.act(action).await,
         }
     }
-}
 
-impl<'a> MakeWriter<'a> for LogBuffer {
-    type Writer = LogWriter;
-    fn make_writer(&'a self) -> LogWriter {
-        LogWriter {
-            buffer: self.clone(),
-            pending: Vec::new(),
+    async fn view(&mut self) -> anyhow::Result<View> {
+        match self {
+            Self::Local(controller) => {
+                controller.poll().await;
+                controller.view().await
+            }
+            Self::Service(client) => client.view().await.context("lost the connection to the dvpn service"),
         }
     }
-}
-
-// ------------------------------------------------------------------ view model
-
-#[derive(Clone, Debug, Default)]
-pub struct LendingView {
-    pub ready: bool,
-    pub published: bool,
-    pub publicly_reachable: bool,
-    pub relay_reservations: usize,
-    pub sessions: usize,
-    pub max_sessions: usize,
-    pub rate_mbps: u64,
-    pub wan: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct VpnView {
-    /// The client task is running (from `c` until `d` or an error).
-    pub running: bool,
-    pub phase: Phase,
-    /// The kill switch is in place (see [`crate::control::StatusReport::protected`]).
-    pub protected: bool,
-    pub warnings: Vec<String>,
-    pub circuit: Option<CircuitReport>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct View {
-    pub peer_id: String,
-    pub nat: NatState,
-    pub routing_peers: usize,
-    pub lending: LendingView,
-    pub vpn: VpnView,
-    pub selection: Selection,
-    pub measuring: bool,
-    /// From the last measurement, for the current limit.
-    pub availability: Option<Availability>,
-    /// Some test circuits may have gone through our own tunnel, so times read high.
-    pub measured_while_connected: bool,
-    pub logs: Vec<String>,
 }
 
 /// The first-run screen: lending is required to use the VPN.
@@ -183,7 +110,9 @@ pub fn draw_starting(frame: &mut Frame, message: &str) {
     frame.render_widget(Paragraph::new(message).block(block), frame.area());
 }
 
-pub fn draw(frame: &mut Frame, view: &View) {
+/// The dashboard. `service`: shown as a client of the dvpn service, where closing it
+/// leaves the VPN running.
+pub fn draw(frame: &mut Frame, view: &View, service: bool) {
     let [header, top, selection, logs, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(9),
@@ -194,42 +123,70 @@ pub fn draw(frame: &mut Frame, view: &View) {
     .areas(frame.area());
     let [lending, vpn] = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(top);
 
-    let nat = match view.nat {
-        NatState::Unknown => "detecting",
-        NatState::Public => "public",
-        NatState::Private => "behind NAT",
+    let nat = match (view.running, view.nat) {
+        (false, _) => "off",
+        (true, NatState::Unknown) => "detecting",
+        (true, NatState::Public) => "public",
+        (true, NatState::Private) => "behind NAT",
     };
+    let source = if service { "  ·  service" } else { "" };
     frame.render_widget(
         Line::from(vec![
             " dvpn ".bold().reversed(),
-            format!("  you {}  ·  NAT: {nat}  ·  {} peers", short(&view.peer_id), view.routing_peers).into(),
+            format!("  you {}  ·  NAT: {nat}  ·  {} peers{source}", short(&view.peer_id), view.routing_peers).into(),
         ]),
         header,
     );
-    frame.render_widget(lending_panel(&view.lending), lending);
+    frame.render_widget(lending_panel(view, service), lending);
     frame.render_widget(vpn_panel(&view.vpn), vpn);
     frame.render_widget(selection_panel(view), selection);
     frame.render_widget(log_panel(&view.logs, logs), logs);
-    frame.render_widget(
-        Line::from(vec![
-            key("c"),
-            " connect  ".into(),
-            key("d"),
-            " disconnect  ".into(),
-            key("m"),
-            " mode  ".into(),
-            key("+/-"),
-            " ping limit  ".into(),
-            key("r"),
-            " measure  ".into(),
-            key("q"),
-            " quit".into(),
-        ]),
-        footer,
-    );
+    let mut keys = Vec::new();
+    if service && !view.running {
+        keys.extend([key("l"), " lend only  ".into()]);
+    }
+    keys.extend([
+        key("c"),
+        " connect  ".into(),
+        key("d"),
+        " disconnect  ".into(),
+        key("m"),
+        " mode  ".into(),
+        key("+/-"),
+        " ping limit  ".into(),
+        key("r"),
+        " measure  ".into(),
+    ]);
+    if service {
+        keys.extend([key("x"), " turn off  ".into(), key("q"), " close (VPN keeps running)".into()]);
+    } else {
+        keys.extend([key("q"), " quit".into()]);
+    }
+    frame.render_widget(Line::from(keys), footer);
 }
 
-fn lending_panel(l: &LendingView) -> Paragraph<'static> {
+fn lending_panel(view: &View, service: bool) -> Paragraph<'static> {
+    let l = &view.lending;
+    if !view.running {
+        let mut lines = if service {
+            vec![
+                Line::from(vec!["○ Off  ".dim(), "press ".dim(), key("l"), " to lend without connecting".dim()]),
+                Line::from(vec!["Connecting (".dim(), key("c"), ") lends too.".dim()]),
+            ]
+        } else {
+            vec![
+                Line::from(vec!["○ Off  ".dim(), "starts when you press ".dim(), key("c")]),
+                Line::from("Your exit is lent only while dvpn runs.".dim()),
+            ]
+        };
+        if service {
+            lines.push(at_boot_line(view));
+        }
+        if let Some(error) = &view.error {
+            lines.push(Line::from(format!("Stopped: {error}").fg(Color::Red)));
+        }
+        return Paragraph::new(lines).wrap(Wrap { trim: true }).block(Block::bordered().title(" Lending "));
+    }
     let status = if l.ready {
         Line::from("● Lending: others can use your exit".fg(Color::Green).bold())
     } else if !l.published {
@@ -244,14 +201,23 @@ fn lending_panel(l: &LendingView) -> Paragraph<'static> {
     } else {
         "not yet".to_string()
     };
-    let lines = vec![
+    let mut lines = vec![
         status,
         Line::from(format!("Reachable  {reachable}")),
         Line::from(format!("Sessions   {} / {}", l.sessions, l.max_sessions)),
         Line::from(format!("Limit      {} Mbit/s per session", l.rate_mbps)),
         Line::from(format!("WAN        {}", l.wan)),
     ];
-    Paragraph::new(lines).block(Block::bordered().title(" Lending "))
+    if service {
+        lines.push(at_boot_line(view));
+    }
+    Paragraph::new(lines).wrap(Wrap { trim: true }).block(Block::bordered().title(" Lending "))
+}
+
+/// Whether the service lends from boot, and the key that changes it.
+fn at_boot_line(view: &View) -> Line<'static> {
+    let state = if view.lend_at_boot { "on".fg(Color::Green) } else { "off".dim() };
+    Line::from(vec!["At boot    ".into(), state, "  ".into(), key("b"), " change".dim()])
 }
 
 fn vpn_panel(v: &VpnView) -> Paragraph<'static> {
@@ -358,45 +324,26 @@ fn hms(secs: u64) -> String {
 
 // ------------------------------------------------------------------ app
 
-struct App {
-    session: Session,
-    logs: LogBuffer,
-    client: Option<JoinHandle<anyhow::Result<()>>>,
-    client_error: Option<String>,
-    measurement: Option<JoinHandle<Vec<Measurement>>>,
-    measurements: Option<Vec<Measurement>>,
-    /// Whether the VPN was running when the running/last measurement started.
-    measuring_connected: bool,
-    measured_while_connected: bool,
-    /// Kept when switching to random, so switching back restores it.
-    ping_limit: Duration,
-    quit: bool,
-}
-
-/// Runs the TUI. Shows the consent screen if needed, then calls `start` to bring up
-/// the node and lending, then the dashboard until the user quits.
-pub async fn run<F, Fut>(data_dir: &Path, logs: LogBuffer, start: F) -> anyhow::Result<()>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = anyhow::Result<Session>>,
-{
+/// Runs the dashboard until the user quits (or, for the service, closes it).
+pub async fn run(data_dir: &Path, backend: Backend, setup: Vec<Action>) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    let result = run_in(&mut terminal, data_dir, logs, start).await;
+    let result = run_in(&mut terminal, data_dir, backend, setup).await;
     ratatui::restore();
     result
 }
 
-async fn run_in<F, Fut>(terminal: &mut DefaultTerminal, data_dir: &Path, logs: LogBuffer, start: F) -> anyhow::Result<()>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = anyhow::Result<Session>>,
-{
+async fn run_in(terminal: &mut DefaultTerminal, data_dir: &Path, mut backend: Backend, setup: Vec<Action>) -> anyhow::Result<()> {
     // Before any system changes: closing the terminal (SIGHUP) or SIGTERM must still
     // lead to a clean shutdown rather than leftover routes and firewall rules.
     let shutdown = system::shutdown_signal()?;
     tokio::pin!(shutdown);
     let mut events = EventStream::new();
-    if !lend::consent_given(data_dir) {
+
+    let consent_given = match &mut backend {
+        Backend::Local(_) => lend::consent_given(data_dir),
+        Backend::Service(client) => client.view().await?.consent_given,
+    };
+    if !consent_given {
         loop {
             terminal.draw(draw_consent)?;
             match next_key(&mut events).await? {
@@ -405,79 +352,107 @@ where
                 _ => {}
             }
         }
-        lend::record_consent(data_dir)?;
+        backend.act(Action::AcceptExitRisk).await?;
     }
-    if !install::is_installed() && !install::declined(data_dir) {
-        loop {
-            terminal.draw(draw_install_offer)?;
-            match next_key(&mut events).await? {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    // Shown in the log panel; a failure doesn't stop the VPN.
-                    match install::install() {
-                        Ok(path) => info!("installed {}: start dvpn from any terminal by typing `dvpn`", path.display()),
-                        Err(e) => warn!("could not install the dvpn command: {e:#}"),
+    for action in setup {
+        backend.act(action).await?;
+    }
+
+    if let Backend::Local(controller) = &mut backend {
+        if !install::is_installed() && !install::declined(data_dir) {
+            loop {
+                terminal.draw(draw_install_offer)?;
+                match next_key(&mut events).await? {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        // Shown in the log panel; a failure doesn't stop the VPN.
+                        match install::install() {
+                            Ok(path) => info!("installed {}: start dvpn from any terminal by typing `dvpn`", path.display()),
+                            Err(e) => warn!("could not install the dvpn command: {e:#}"),
+                        }
+                        break;
                     }
-                    break;
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        install::record_declined(data_dir)?;
+                        break;
+                    }
+                    KeyCode::Char('q') => return Ok(()),
+                    _ => {}
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    install::record_declined(data_dir)?;
-                    break;
-                }
-                KeyCode::Char('q') => return Ok(()),
-                _ => {}
             }
         }
+        // In-process, lending runs for the whole session.
+        terminal.draw(|f| draw_starting(f, "Starting your node and exit…"))?;
+        controller.start().await?;
     }
 
-    terminal.draw(|f| draw_starting(f, "Starting your node and exit…"))?;
-    let session = start().await?;
-    let ping_limit = match *session.state.selection.lock().expect("state lock") {
-        Selection::MaxPing(limit) => limit,
-        Selection::Random => DEFAULT_PING_LIMIT,
-    };
-    let mut app = App {
-        session,
-        logs,
-        client: None,
-        client_error: None,
-        measurement: None,
-        measurements: None,
-        measuring_connected: false,
-        measured_while_connected: false,
-        ping_limit,
-        quit: false,
-    };
-
+    let service = backend.is_service();
+    let mut notice: Option<String> = None;
+    let mut view = backend.view().await?;
     let mut tick = tokio::time::interval(TICK);
     let result = loop {
+        let mut quit = false;
         tokio::select! {
             _ = tick.tick() => {}
             event = events.next() => match event {
-                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key).await,
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => match command(key, &view, service) {
+                    Command::Quit => quit = true,
+                    Command::Act(action) => {
+                        notice = backend.act(action).await.err().map(|e| format!("{e:#}"));
+                    }
+                    Command::None => {}
+                },
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Err(e).context("reading terminal input"),
                 None => break Ok(()),
             },
-            () = &mut shutdown => app.quit = true,
-            result = &mut app.session.node.task => break Err(anyhow::anyhow!("node stopped: {:?}", result)),
+            () = &mut shutdown => quit = true,
         }
-        if app.quit {
+        if quit {
             break Ok(());
         }
-        app.poll_tasks().await;
-        let view = match app.view().await {
+        view = match backend.view().await {
             Ok(view) => view,
             Err(e) => break Err(e),
         };
+        if let Some(notice) = &notice {
+            view.error = Some(notice.clone());
+        }
         // The terminal may be gone (window closed): stop drawing, but still shut down.
-        if let Err(e) = terminal.draw(|f| draw(f, &view)) {
+        if let Err(e) = terminal.draw(|f| draw(f, &view, service)) {
             break Err(e).context("drawing the dashboard");
         }
     };
 
-    let _ = terminal.draw(|f| draw_starting(f, "Disconnecting and restoring your network…"));
-    app.shutdown().await;
+    if let Backend::Local(mut controller) = backend {
+        let _ = terminal.draw(|f| draw_starting(f, "Disconnecting and restoring your network…"));
+        controller.stop().await;
+    }
     result
+}
+
+enum Command {
+    Act(Action),
+    Quit,
+    None,
+}
+
+fn command(key: KeyEvent, view: &View, service: bool) -> Command {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let step = PING_STEP.as_millis() as i64;
+    match key.code {
+        KeyCode::Char('c') if ctrl => Command::Quit,
+        KeyCode::Char('q') | KeyCode::Esc => Command::Quit,
+        KeyCode::Char('c') => Command::Act(Action::Connect),
+        KeyCode::Char('l') if service => Command::Act(Action::Lend),
+        KeyCode::Char('b') if service => Command::Act(Action::SetLendAtBoot { enabled: !view.lend_at_boot }),
+        KeyCode::Char('d') => Command::Act(Action::Disconnect),
+        KeyCode::Char('x') if service => Command::Act(Action::Stop),
+        KeyCode::Char('m') => Command::Act(selection_action(view.toggled_selection())),
+        KeyCode::Char('+') | KeyCode::Char('=') => view.adjusted_selection(step).map_or(Command::None, |s| Command::Act(selection_action(s))),
+        KeyCode::Char('-') => view.adjusted_selection(-step).map_or(Command::None, |s| Command::Act(selection_action(s))),
+        KeyCode::Char('r') => Command::Act(Action::Measure),
+        _ => Command::None,
+    }
 }
 
 async fn next_key(events: &mut EventStream) -> anyhow::Result<KeyCode> {
@@ -496,159 +471,11 @@ async fn next_key(events: &mut EventStream) -> anyhow::Result<KeyCode> {
     }
 }
 
-impl App {
-    async fn on_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('c') => self.connect(),
-            KeyCode::Char('d') => self.disconnect().await,
-            KeyCode::Char('m') => {
-                let next = match self.selection() {
-                    Selection::Random => Selection::MaxPing(self.ping_limit),
-                    Selection::MaxPing(_) => Selection::Random,
-                };
-                self.set_selection(next);
-                if matches!(next, Selection::MaxPing(_)) && self.measurements.is_none() {
-                    self.measure();
-                }
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') => self.adjust_limit(|l| (l + PING_STEP).min(MAX_PING)),
-            KeyCode::Char('-') => self.adjust_limit(|l| l.saturating_sub(PING_STEP).max(MIN_PING)),
-            KeyCode::Char('r') => self.measure(),
-            _ => {}
-        }
-    }
-
-    fn selection(&self) -> Selection {
-        *self.session.state.selection.lock().expect("state lock")
-    }
-
-    /// Takes effect at the next circuit: reconnects, and the switch to a dedicated exit.
-    fn set_selection(&self, selection: Selection) {
-        *self.session.state.selection.lock().expect("state lock") = selection;
-    }
-
-    fn adjust_limit(&mut self, f: impl Fn(Duration) -> Duration) {
-        if let Selection::MaxPing(limit) = self.selection() {
-            self.ping_limit = f(limit);
-            self.set_selection(Selection::MaxPing(self.ping_limit));
-        }
-    }
-
-    fn connect(&mut self) {
-        if self.client.is_some() {
-            return;
-        }
-        self.client_error = None;
-        let state = &self.session.state;
-        state.set_error(None);
-        state.set_phase(Phase::Idle);
-        self.client = Some(tokio::spawn(client::run(
-            self.session.node.handle.clone(),
-            self.session.options.clone(),
-            state.clone(),
-        )));
-    }
-
-    /// Dropping the client restores routing and DNS; waits until it has.
-    async fn disconnect(&mut self) {
-        if let Some(task) = self.client.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        let state = &self.session.state;
-        state.set_phase(Phase::Idle);
-        *state.circuit.lock().expect("state lock") = None;
-    }
-
-    fn measure(&mut self) {
-        if self.measurement.is_some() {
-            return;
-        }
-        let handle = self.session.node.handle.clone();
-        self.measuring_connected = self.session.state.protected.load(Ordering::Relaxed);
-        self.measurement = Some(tokio::spawn(async move {
-            let (Ok(exits), Ok(relays)) = (handle.find_exits().await, handle.find_relays().await) else {
-                return Vec::new();
-            };
-            select::measure_exits(&handle, exits, relays, &|_, _| Ok(())).await
-        }));
-    }
-
-    async fn poll_tasks(&mut self) {
-        if self.client.as_ref().is_some_and(JoinHandle::is_finished) {
-            let task = self.client.take().expect("checked");
-            self.client_error = match task.await {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(format!("{e:#}")),
-                Err(e) => Some(format!("client task failed: {e}")),
-            };
-            self.session.state.set_phase(Phase::Idle);
-        }
-        if self.measurement.as_ref().is_some_and(JoinHandle::is_finished) {
-            let task = self.measurement.take().expect("checked");
-            self.measurements = Some(task.await.unwrap_or_default());
-            self.measured_while_connected = self.measuring_connected;
-        }
-    }
-
-    async fn view(&self) -> anyhow::Result<View> {
-        let handle = &self.session.node.handle;
-        let status = handle.status().await.context("node stopped")?;
-        let routing_peers = handle.routing_peers().await.context("node stopped")?.len();
-        let state = &self.session.state;
-        let lending = self.session.lending.handle();
-        let selection = self.selection();
-        let availability = match (selection, &self.measurements) {
-            (Selection::MaxPing(limit), Some(m)) => Some(select::availability(m, limit)),
-            _ => None,
-        };
-        Ok(View {
-            peer_id: handle.peer_id().to_string(),
-            nat: status.nat,
-            routing_peers,
-            lending: LendingView {
-                ready: lending.ready(&status),
-                published: status.exit_published,
-                publicly_reachable: status.publicly_reachable || status.nat == NatState::Public,
-                relay_reservations: status.relay_reservations,
-                sessions: lending.active.load(Ordering::Relaxed),
-                max_sessions: lending.max_sessions,
-                rate_mbps: lending.rate_mbps,
-                wan: lending.wan.clone(),
-            },
-            vpn: VpnView {
-                running: self.client.is_some(),
-                phase: *state.phase.lock().expect("state lock"),
-                protected: state.protected.load(Ordering::Relaxed),
-                warnings: state.warnings.lock().expect("state lock").clone(),
-                circuit: state.circuit.lock().expect("state lock").clone(),
-                last_error: self.client_error.clone().or_else(|| state.last_error.lock().expect("state lock").clone()),
-            },
-            selection,
-            measuring: self.measurement.is_some(),
-            availability,
-            measured_while_connected: self.measured_while_connected,
-            logs: self.logs.lines(),
-        })
-    }
-
-    /// The VPN first (restores routes), then lending (restores the firewall), then the node.
-    async fn shutdown(mut self) {
-        self.disconnect().await;
-        if let Some(task) = self.measurement.take() {
-            task.abort();
-        }
-        drop(self.session.lending);
-        let _ = self.session.node.handle.shutdown().await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::CircuitReport;
+    use crate::controller::LendingView;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -669,6 +496,10 @@ mod tests {
     fn view() -> View {
         View {
             peer_id: "12D3KooWAbCdEfGhIjKlMnOpQrStUvWxYz".into(),
+            consent_given: true,
+            lend_at_boot: false,
+            running: true,
+            error: None,
             nat: NatState::Private,
             routing_peers: 5,
             lending: LendingView {
@@ -683,6 +514,7 @@ mod tests {
             },
             vpn: VpnView::default(),
             selection: Selection::Random,
+            ping_limit_ms: 100,
             measuring: false,
             availability: None,
             measured_while_connected: false,
@@ -711,7 +543,7 @@ mod tests {
 
     #[test]
     fn dashboard_shows_lending_and_a_disconnected_vpn() {
-        let screen = render(|f| draw(f, &view()));
+        let screen = render(|f| draw(f, &view(), false));
         assert!(screen.contains("Lending: others can use your exit"));
         assert!(screen.contains("through 1 relay"));
         assert!(screen.contains("Sessions   2 / 16"));
@@ -728,7 +560,7 @@ mod tests {
         v.lending.published = false;
         v.vpn.running = true;
         v.vpn.phase = Phase::WaitingForLending;
-        let screen = render(|f| draw(f, &v));
+        let screen = render(|f| draw(f, &v, false));
         assert!(screen.contains("Starting: publishing your exit"));
         assert!(screen.contains("Waiting for your exit to be lent first"));
         assert!(screen.contains("Not protected yet"), "no kill switch before the first circuit");
@@ -748,7 +580,7 @@ mod tests {
             assigned_ip: "10.77.12.3".into(),
             connected_since: now_secs() - 3725,
         });
-        let screen = render(|f| draw(f, &v));
+        let screen = render(|f| draw(f, &v, false));
         assert!(screen.contains("● Connected"));
         assert!(screen.contains("12D3Ko…9876 (dedicated)"));
         assert!(screen.contains("10.77.12.3"));
@@ -764,7 +596,7 @@ mod tests {
         v.vpn.phase = Phase::Paused;
         v.vpn.protected = true;
         v.vpn.last_error = Some("lending is down".into());
-        let screen = render(|f| draw(f, &v));
+        let screen = render(|f| draw(f, &v, false));
         assert!(screen.contains("Paused: lending is down, traffic is blocked"));
         assert!(screen.contains("Last error: lending is down"));
     }
@@ -781,31 +613,89 @@ mod tests {
         };
 
         v.availability = Some(fits(3, 1));
-        let screen = render(|f| draw(f, &v));
+        let screen = render(|f| draw(f, &v, false));
         assert!(screen.contains("max ping 80 ms"));
         assert!(screen.contains("Within 80 ms: 3 dedicated · 1 lent by users  (6 measured, fastest 23 ms)"));
 
         v.availability = Some(fits(0, 2));
-        assert!(render(|f| draw(f, &v)).contains("would use another user's exit"));
+        assert!(render(|f| draw(f, &v, false)).contains("would use another user's exit"));
 
         v.availability = Some(fits(0, 0));
-        assert!(render(|f| draw(f, &v)).contains("No exit within 80 ms"));
+        assert!(render(|f| draw(f, &v, false)).contains("No exit within 80 ms"));
 
         v.availability = None;
         v.measuring = true;
-        assert!(render(|f| draw(f, &v)).contains("Measuring exits"));
+        assert!(render(|f| draw(f, &v, false)).contains("Measuring exits"));
     }
 
     #[test]
-    fn log_buffer_keeps_the_most_recent_lines() {
-        use std::io::Write;
-        let logs = LogBuffer::default();
-        for i in 0..LOG_LINES + 10 {
-            let mut writer = logs.make_writer();
-            writeln!(writer, "line {i}").unwrap();
-        }
-        let lines = logs.lines();
-        assert_eq!(lines.len(), LOG_LINES);
-        assert_eq!(lines.last().unwrap(), &format!("line {}", LOG_LINES + 9));
+    fn dashboard_shows_lending_off_and_why_it_stopped() {
+        let mut v = view();
+        v.running = false;
+        v.routing_peers = 0;
+        v.error = Some("the node stopped".into());
+        let screen = render(|f| draw(f, &v, false));
+        assert!(screen.contains("○ Off"));
+        assert!(screen.contains("NAT: off"));
+        assert!(screen.contains("Stopped: the node stopped"));
+        assert!(!screen.contains("Sessions"));
+    }
+
+    #[test]
+    fn as_a_service_client_lending_can_start_without_connecting() {
+        let mut v = view();
+        v.running = false;
+        let screen = render(|f| draw(f, &v, true));
+        assert!(screen.contains("to lend without connecting"));
+        assert!(screen.contains("lend only"));
+        // Once lending runs, the key isn't offered again.
+        assert!(!render(|f| draw(f, &view(), true)).contains("lend only"));
+        // In-process, lending runs for the whole session, so there is nothing to start.
+        assert!(!render(|f| draw(f, &v, false)).contains("lend only"));
+    }
+
+    #[test]
+    fn as_a_service_client_lending_at_boot_is_shown() {
+        let mut v = view();
+        assert!(render(|f| draw(f, &v, true)).contains("At boot    off"));
+        v.lend_at_boot = true;
+        assert!(render(|f| draw(f, &v, true)).contains("At boot    on"));
+        v.running = false;
+        assert!(render(|f| draw(f, &v, true)).contains("At boot    on"), "shown while lending is off too");
+        assert!(!render(|f| draw(f, &v, false)).contains("At boot"), "only the service starts at boot");
+    }
+
+    #[test]
+    fn as_a_service_client_closing_keeps_the_vpn_running() {
+        let screen = render(|f| draw(f, &view(), true));
+        assert!(screen.contains("·  service"));
+        assert!(screen.contains("turn off"));
+        assert!(screen.contains("close (VPN keeps running)"));
+        assert!(!render(|f| draw(f, &view(), false)).contains("turn off"));
+    }
+
+    #[test]
+    fn keys_become_actions() {
+        let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let act = |c, v: &View, service| match command(press(c), v, service) {
+            Command::Act(action) => Some(action),
+            _ => None,
+        };
+        let mut v = view();
+        assert_eq!(act('c', &v, false), Some(Action::Connect));
+        assert_eq!(act('x', &v, true), Some(Action::Stop));
+        assert_eq!(act('l', &v, true), Some(Action::Lend));
+        assert_eq!(act('l', &v, false), None, "in-process, lending always runs");
+        assert_eq!(act('b', &v, true), Some(Action::SetLendAtBoot { enabled: true }));
+        assert_eq!(act('b', &v, false), None, "only the service starts at boot");
+        assert_eq!(act('x', &v, false), None, "in-process, quitting turns it off");
+        assert_eq!(act('m', &v, false), Some(Action::SetSelection { max_ping_ms: Some(100) }));
+        assert_eq!(act('+', &v, false), None, "no limit to change in random mode");
+
+        v.selection = Selection::MaxPing(Duration::from_millis(5));
+        assert_eq!(act('m', &v, false), Some(Action::SetSelection { max_ping_ms: None }));
+        assert_eq!(act('+', &v, false), Some(Action::SetSelection { max_ping_ms: Some(15) }));
+        assert_eq!(act('-', &v, false), Some(Action::SetSelection { max_ping_ms: Some(1) }), "never below 1 ms");
+        assert!(matches!(command(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &v, true), Command::Quit));
     }
 }

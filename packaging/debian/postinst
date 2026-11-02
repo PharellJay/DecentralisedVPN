@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    # The group whose members control the service (packaging/dvpn.sysusers).
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+        systemd-sysusers dvpn.conf
+    elif ! getent group dvpn >/dev/null; then
+        groupadd --system dvpn
+    fi
+
+    # Whoever installed the package (via sudo, or pkexec from a software centre)
+    # gets control of the VPN, so the app works without further setup.
+    installer="${SUDO_USER:-}"
+    if [ -z "$installer" ] && [ -n "${PKEXEC_UID:-}" ]; then
+        installer="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)"
+    fi
+    if [ -n "$installer" ] && [ "$installer" != "root" ] && id "$installer" >/dev/null 2>&1; then
+        if ! id -nG "$installer" | tr ' ' '\n' | grep -qx dvpn; then
+            usermod -aG dvpn "$installer"
+            echo "dvpn: added $installer to the dvpn group. Log out and back in, then run \`dvpn\` or open the dvpn app."
+        fi
+    else
+        echo "dvpn: to control the VPN without sudo, add yourself to the dvpn group: sudo usermod -aG dvpn \$USER"
+    fi
+fi
+
+#DEBHELPER#

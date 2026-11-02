@@ -1,20 +1,28 @@
-//! Local status API over a Unix socket at `<data-dir>/control.sock`, or in the
-//! private `$XDG_RUNTIME_DIR` when that path is too long for a Unix socket.
+//! Local control API over a Unix socket.
 //!
-//! Both directories are private to the user and the socket is 0600, so only the
-//! owner can query it. World-writable locations like /tmp are never used.
+//! - `dvpn run` and `dvpn connect` serve status only, at `<data-dir>/control.sock` (or in
+//!   the private `$XDG_RUNTIME_DIR` when that path is too long for a Unix socket). Both
+//!   directories are private to the user and the socket is 0600, so only the owner can
+//!   query it. World-writable locations like /tmp are never used.
+//! - `dvpn daemon` also takes [`Action`]s, at [`crate::daemon::SERVICE_SOCKET`], which
+//!   only root and the `dvpn` group can open (see `crate::daemon`).
+//!
+//! The protocol is one JSON [`Request`] per line, each answered by one JSON
+//! [`Response`] line, e.g. `{"cmd":"status"}` or `{"cmd":"act","action":"connect"}`.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::controller::{Action, View};
 use crate::lend::LendingHandle;
 use crate::node::NodeHandle;
 use crate::select::{ProbeReport, Selection};
@@ -22,6 +30,40 @@ use crate::select::{ProbeReport, Selection};
 const SOCKET_FILE: &str = "control.sock";
 /// `sun_path` is 108 bytes on Linux, including the terminating NUL.
 const MAX_SOCKET_PATH: usize = 107;
+/// Longer request lines are refused (the connection is closed).
+const MAX_REQUEST: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum Request {
+    /// The node's [`StatusReport`].
+    Status,
+    /// The service's whole state, as shown by its dashboards (`dvpn daemon` only).
+    View,
+    /// Something the user wants done (`dvpn daemon` only).
+    Act(Action),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Response {
+    Status(Box<StatusReport>),
+    View(Box<View>),
+    /// The action was carried out.
+    Done,
+    Error(String),
+}
+
+impl Response {
+    pub fn from_result(result: anyhow::Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Done,
+            Err(e) => Self::Error(format!("{e:#}")),
+        }
+    }
+}
+
+pub type Handler = Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitReport {
@@ -117,31 +159,69 @@ pub fn socket_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
 
 /// Binds the socket, refusing to start if another instance is already serving it.
 pub async fn bind(data_dir: &Path) -> anyhow::Result<UnixListener> {
-    let path = socket_path(data_dir)?;
+    bind_path(&socket_path(data_dir)?, 0o600)
+        .await
+        .with_context(|| format!("starting dvpn with {}", data_dir.display()))
+}
+
+/// Binds a socket at `path` with `mode`, replacing a stale socket but never a live one.
+pub async fn bind_path(path: &Path, mode: u32) -> anyhow::Result<UnixListener> {
     if path.exists() {
-        if UnixStream::connect(&path).await.is_ok() {
-            bail!("another dvpn instance is already running with {}", data_dir.display());
+        if UnixStream::connect(path).await.is_ok() {
+            bail!("another dvpn instance is already running ({} is in use)", path.display());
         }
-        std::fs::remove_file(&path).context("removing stale control socket")?;
+        std::fs::remove_file(path).context("removing stale control socket")?;
     }
-    let listener = UnixListener::bind(&path).context("binding control socket")?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = UnixListener::bind(path).context("binding control socket")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(listener)
 }
 
+/// Serves status for `dvpn run` and `dvpn connect`, which take no actions.
 pub async fn serve(listener: UnixListener, handle: NodeHandle, state: SharedState) {
-    while let Ok((mut stream, _)) = listener.accept().await {
-        // A failed report (e.g. the node is shutting down) skips this request only.
-        let Ok(report) = report(&handle, &state).await else {
-            continue;
-        };
-        let mut json = serde_json::to_vec(&report).expect("serializable");
-        json.push(b'\n');
-        let _ = stream.write_all(&json).await;
+    let handler: Handler = Arc::new(move |request| {
+        let (handle, state) = (handle.clone(), state.clone());
+        Box::pin(async move {
+            match request {
+                Request::Status => match report(&handle, &state).await {
+                    Ok(report) => Response::Status(Box::new(report)),
+                    Err(e) => Response::Error(format!("{e:#}")),
+                },
+                Request::View | Request::Act(_) => Response::Error(
+                    "this node was started from the command line; only the dvpn service takes actions".into(),
+                ),
+            }
+        })
+    });
+    serve_with(listener, handler).await;
+}
+
+/// Answers requests on every connection with `handler`, until the listener fails.
+pub async fn serve_with(listener: UnixListener, handler: Handler) {
+    while let Ok((stream, _)) = listener.accept().await {
+        tokio::spawn(answer(stream, handler.clone()));
     }
 }
 
-async fn report(handle: &NodeHandle, state: &SharedState) -> anyhow::Result<StatusReport> {
+async fn answer(stream: UnixStream, handler: Handler) -> std::io::Result<()> {
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    loop {
+        let mut line = String::new();
+        if (&mut reader).take(MAX_REQUEST).read_line(&mut line).await? == 0 || !line.ends_with('\n') {
+            return Ok(()); // Closed, or a request too long to be ours.
+        }
+        let response = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => handler(request).await,
+            Err(e) => Response::Error(format!("invalid request: {e}")),
+        };
+        let mut json = serde_json::to_vec(&response).map_err(std::io::Error::other)?;
+        json.push(b'\n');
+        write.write_all(&json).await?;
+    }
+}
+
+pub(crate) async fn report(handle: &NodeHandle, state: &SharedState) -> anyhow::Result<StatusReport> {
     let status = handle.status().await?;
     Ok(StatusReport {
         peer_id: handle.peer_id().to_string(),
@@ -162,13 +242,78 @@ async fn report(handle: &NodeHandle, state: &SharedState) -> anyhow::Result<Stat
     })
 }
 
-/// Client side of `dvpn status`.
+/// Client side of `dvpn status` for `dvpn run` and `dvpn connect`.
 pub async fn query(data_dir: &Path) -> anyhow::Result<StatusReport> {
     let path = socket_path(data_dir)?;
-    let mut stream = UnixStream::connect(&path)
+    let stream = UnixStream::connect(&path)
         .await
         .with_context(|| format!("no running dvpn node for {} (is `dvpn run` or `dvpn connect` running?)", data_dir.display()))?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    Ok(serde_json::from_slice(&buf)?)
+    match Client::new(stream).send(&Request::Status).await? {
+        Response::Status(report) => Ok(*report),
+        Response::Error(e) => bail!("{e}"),
+        other => bail!("unexpected answer: {other:?}"),
+    }
+}
+
+/// One connection to a control socket; requests are answered in order.
+pub struct Client {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl Client {
+    pub fn new(stream: UnixStream) -> Self {
+        let (read, writer) = stream.into_split();
+        Self {
+            reader: BufReader::new(read),
+            writer,
+        }
+    }
+
+    pub async fn connect(path: &Path) -> std::io::Result<Self> {
+        Ok(Self::new(UnixStream::connect(path).await?))
+    }
+
+    pub async fn send(&mut self, request: &Request) -> anyhow::Result<Response> {
+        let mut json = serde_json::to_vec(request)?;
+        json.push(b'\n');
+        self.writer.write_all(&json).await.context("sending to dvpn")?;
+        let mut line = String::new();
+        if self.reader.read_line(&mut line).await.context("reading from dvpn")? == 0 {
+            bail!("dvpn closed the connection");
+        }
+        serde_json::from_str(&line).context("invalid answer from dvpn")
+    }
+
+    pub async fn view(&mut self) -> anyhow::Result<View> {
+        match self.send(&Request::View).await? {
+            Response::View(view) => Ok(*view),
+            Response::Error(e) => bail!("{e}"),
+            other => bail!("unexpected answer: {other:?}"),
+        }
+    }
+
+    pub async fn act(&mut self, action: Action) -> anyhow::Result<()> {
+        match self.send(&Request::Act(action)).await? {
+            Response::Done => Ok(()),
+            Response::Error(e) => bail!("{e}"),
+            other => bail!("unexpected answer: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requests_are_flat_json_objects() {
+        let set = Request::Act(Action::SetSelection { max_ping_ms: Some(80) });
+        let json = serde_json::to_string(&set).unwrap();
+        assert_eq!(json, r#"{"cmd":"act","action":"set_selection","max_ping_ms":80}"#);
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), set);
+        assert_eq!(serde_json::from_str::<Request>(r#"{"cmd":"act","action":"connect"}"#).unwrap(), Request::Act(Action::Connect));
+        assert_eq!(serde_json::from_str::<Request>(r#"{"cmd":"status"}"#).unwrap(), Request::Status);
+        assert!(serde_json::from_str::<Request>(r#"{"cmd":"act","action":"rm -rf"}"#).is_err());
+    }
 }

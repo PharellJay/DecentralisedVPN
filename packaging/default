@@ -1,0 +1,6 @@
+# Options for the dvpn service (`dvpn daemon`), e.g.:
+#   DVPN_OPTS="--dns 1.1.1.1 --exit-rate-mbps 5 --max-ping 80"
+# Run `dvpn daemon --help` for the full list. Bootstrap peers are best added with
+# `dvpn ctl add-bootstrap <addr>` or the app; they're kept in /var/lib/dvpn/config.json.
+# Restart the service after changing this file: sudo systemctl restart dvpn
+DVPN_OPTS=""

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=dvpn
+GenericName=Peer-to-peer VPN
+Comment=Connect to the dvpn network and lend your connection in return
+Exec=dvpn-gui
+Icon=dvpn
+Terminal=false
+Categories=Network;Security;
+Keywords=vpn;privacy;p2p;
+StartupWMClass=dvpn-gui

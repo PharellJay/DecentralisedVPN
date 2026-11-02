@@ -5,7 +5,8 @@ peer's IP address, routed through two hops so no single peer sees both who you a
 where you're going. See [docs/DESIGN.md](docs/DESIGN.md) for the architecture, threat model
 and known limitations. **Read the limitations before relying on it.**
 
-**Status:** MVP (milestones M1–M4), Linux only, IPv4 only.
+**Status:** MVP (milestones M1–M4), Linux only, IPv4 only. Installs as a Debian/Ubuntu
+package with a background service and a desktop app.
 
 **Lend to use:** you can only route your traffic through the network while your own
 machine lends its IP to others as an exit. `dvpn connect` does both at once. See
@@ -24,11 +25,72 @@ cargo build --release
 run under `sudo` uses root's own identity, in `/root/.local/share/dvpn` unless you pass
 `--data-dir`.
 
+## Install as an app (Debian / Ubuntu)
+
+This builds two packages:
+- `dvpn`: the command and a background service;
+- `dvpn-gui`: a desktop app with a tray icon.
+
+```sh
+cargo install cargo-deb
+# The desktop app needs WebKitGTK headers to build (not to run):
+sudo apt install pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev
+cargo deb                  # target/debian/dvpn_<version>_amd64.deb
+cargo deb -p dvpn-gui      # target/debian/dvpn-gui_<version>_amd64.deb
+sudo apt install ./target/debian/dvpn_*.deb ./target/debian/dvpn-gui_*.deb
+```
+
+Installing adds you to the `dvpn` group. Log out and back in once, then open **dvpn**
+from your applications menu. If you used `dvpn install` before, remove that older copy
+with `sudo rm /usr/local/bin/dvpn`, since it comes first on your PATH.
+
+- The first time, it shows what lending means and asks you to accept.
+- Add a bootstrap peer under **Bootstrap peer**, then press **Connect**.
+- To help the network without using the VPN yourself, press **Start lending** under
+  **Lending** (or **Lend without connecting** in the tray menu). Tick **Start lending
+  when this computer starts** to keep lending after every restart.
+- Closing the window keeps the tray icon. **Quit** closes the app but leaves the VPN as
+  it is. **Turn off** disconnects and stops lending.
+
+The service (`dvpn daemon`, run by systemd) does the networking as root. The app, the
+`dvpn` dashboard and `dvpn ctl` are its clients and need no sudo.
+- **When it runs:** it starts at boot, idle: it does nothing on the network until you
+  lend or connect, or until it starts lending by itself if lending at boot is on. If
+  that fails (e.g. no network yet), it tries again every 30 s. **Turn off** stops it
+  until the next boot.
+- **Who can control it:** only root and members of the `dvpn` group can open its
+  control socket (`/run/dvpn/control.sock`).
+- **Where its data is:** `/var/lib/dvpn`. Its options are in `/etc/default/dvpn`.
+- **Logs:** `journalctl -u dvpn`, or `dvpn ctl logs`.
+
+To give another account control: `sudo usermod -aG dvpn <user>`.
+Removing the packages keeps the node's keys; `sudo apt purge dvpn` deletes them.
+
+### `dvpn ctl`: the service from the command line
+
+```sh
+dvpn ctl status                 # lending, VPN, exits; --json for everything
+dvpn ctl terms                  # what lending means
+dvpn ctl accept-exit-risk
+dvpn ctl add-bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW...
+dvpn ctl lend                   # lend without connecting the VPN yourself
+dvpn ctl lend-at-boot on        # lend from every boot (off to stop)
+dvpn ctl connect
+dvpn ctl max-ping 80            # or: dvpn ctl random
+dvpn ctl disconnect             # lending keeps running
+dvpn ctl off                    # disconnect and stop lending
+dvpn ctl logs
+```
+
 ## Use it
 
 ### The dashboard (TUI)
 
-The easiest way to use dvpn. The first time, point it at any peer you know:
+With the packages installed, `dvpn` opens the dashboard as a client of the service. It
+needs no sudo, and closing it (`q`) leaves the VPN running. `x` turns it off.
+
+Without the packages, the dashboard runs everything itself, as root. This is the easiest
+way to try dvpn from a source build. The first time, point it at any peer you know:
 
 ```sh
 target/release/dvpn tui --bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW...
@@ -66,6 +128,8 @@ The dashboard shows:
 | Key | Action |
 |---|---|
 | `c` / `d` | connect / disconnect the VPN (lending keeps running) |
+| `l` | with the service: lend without connecting |
+| `b` | with the service: lend from boot, on / off |
 | `m` | switch between random and max-ping mode |
 | `+` / `-` | raise / lower the ping limit by 10 ms |
 | `r` | measure exits again |
@@ -179,8 +243,10 @@ list.
 | Command | Main options |
 |---|---|
 | `run` | `--listen`, `--bootstrap`, `--reachability`, `--no-relay`, `--relay-rate-mbps`, `--exit`, `--accept-exit-risk`, `--wan`, `--exit-deny`, `--exit-max-sessions`, `--exit-rate-mbps` |
-| `tui` (or no command) | same as `connect` |
+| `tui` (or no command) | same as `connect`, plus `--local` to run in-process even with the service installed |
 | `install` / `uninstall` | — |
+| `daemon` | same as `connect`, plus `--socket`; data in `/var/lib/dvpn` by default |
+| `ctl <command>` | `--socket`; commands: `status`, `lend`, `lend-at-boot`, `connect`, `disconnect`, `off`, `random`, `max-ping`, `measure`, `terms`, `accept-exit-risk`, `add-bootstrap`, `logs` |
 | `connect` | `--bootstrap`, `--max-ping <ms>`, `--dns <ip\|none>`, `--tun-name`, `--listen`, `--reachability`, `--accept-exit-risk`, `--wan`, `--exit-deny`, `--exit-max-sessions`, `--exit-rate-mbps` |
 | `status` | — |
 
@@ -202,7 +268,7 @@ network, DNS and `/usr/local/bin` are not touched.
 ## Test
 
 ```sh
-cargo test                       # no root needed
+cargo test                       # no root needed (the dvpn crate; the app: cargo build -p dvpn-gui)
 sudo scripts/netns-test.sh       # real TUN, routes and NAT in throwaway namespaces
 ```
 
@@ -216,5 +282,6 @@ sudo scripts/netns-test.sh       # real TUN, routes and NAT in throwaway namespa
 | `tests/lending.rs` | real nodes on localhost | when lending counts as ready (public, behind NAT); `connect` refuses to run without lending and builds no circuit until it is ready |
 | `tests/selection.rs` | real nodes on localhost | dedicated exits before other users' exits; max-ping measures through test circuits, picks within the limit, and reports when nothing qualifies |
 | `src/tui.rs` (unit tests) | the dashboard rendered into a test buffer | consent screen, lending states, connected/waiting/paused, max-ping availability |
+| `tests/daemon.rs` | the service on a temporary socket (lending can't start without root) | socket permissions, consent before anything starts, start failures reported to clients, bootstrap peers validated and saved, several clients at once, malformed requests |
 | `tests/data_path.rs` | real nodes, with in-memory devices instead of TUN | the full packet path, exit policy and anti-spoofing; the status socket |
 | `scripts/netns-test.sh` | real TUN devices, routes and NAT in network namespaces (needs root) | identity swapping as seen by a web server, exit policy, kill switch, reconnect, a silently frozen exit, firewall and route cleanup, an exit behind NAT, another user's exit used only as a last resort, then left for a dedicated exit; max-ping mode; kill-switch routes surviving reconnects |

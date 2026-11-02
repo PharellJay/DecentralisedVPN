@@ -54,7 +54,8 @@ traffic. There is no central server, account, or authority.
 | An exit behind NAT is reached through Circuit Relay v2, whose libp2p default limits are 2 min / 128 KiB per relayed connection, unless DCUtR hole punching upgrades it to a direct connection. | DCUtR is enabled. In practice a NATed exit holds outbound connections to the relays, which carry the splice directly. | **Partially mitigated** |
 | The kill switch only protects while `dvpn connect` runs. If the process is killed or crashes, the TUN device vanishes and normal routing resumes. | Reconnects forever instead of giving up; Ctrl-C restores routes cleanly. | **Partially mitigated** |
 | A silently vanished exit (host gone, no TCP reset) is only noticed when the transport times out. | End-to-end tunnel keepalive (§3.4): detected within 30–36 s; the exit also frees silent sessions after 60 s. | **Mitigated** |
-| `connect` and `run --exit` run as root for their whole lifetime. | None yet (no privilege drop after setup). | **Unmitigated** |
+| `connect`, `run --exit` and the service run as root for their whole lifetime. | The service is sandboxed by systemd (only network capabilities, read-only system directories, no access to home directories), and its user interfaces run unprivileged (§3.12). No privilege drop inside the process yet. | **Partially mitigated** |
+| Members of the `dvpn` group can turn the VPN and lending on or off, and add bootstrap peers. | Only a fixed set of actions passes through the socket (§3.12). Joining the group needs root. | **Accepted**: it's what the group is for |
 | Every user's IP is published in the DHT as an exit (a consequence of lend-to-use), so anyone can list dvpn users. | None; it's what lending requires. It also means a complaint about an exit IP can be checked against the public exit list. | **Inherent** |
 | The bypass rule matches the listen port (4001) as a source port for any local process, so an app binding that port bypasses the tunnel. | Only root-run or deliberately configured apps bind a fixed source port. | **Accepted** |
 | Running `dvpn` from a user-writable build directory under sudo means whoever can write that file gets root. | Use the installed `/usr/local/bin/dvpn` (root-owned) day to day. | **Documented** |
@@ -295,7 +296,8 @@ exit too, and there is no way to connect without one.
 ### 3.10 Exit selection
 - **Tiers.** Each exit record carries a signed, self-declared `kind`:
   - `Dedicated`: from `dvpn run --exit`.
-  - `User`: from `dvpn connect`, a user lending while connected.
+  - `User`: from `dvpn connect`, the dashboard or the service: a user's machine,
+    lending while connected or on its own (§3.12).
 
   Clients choose among dedicated exits. They use another user's exit only when no
   dedicated exit fits the selection mode. While on a user's exit, the client checks
@@ -321,10 +323,15 @@ exit too, and there is no way to connect without one.
 - The mode is read before every circuit attempt, so it can be changed while running
   (used by the TUI).
 
-### 3.11 TUI (`sudo dvpn tui`)
-- A single process runs the node, lending and the VPN client, and draws a dashboard
-  with ratatui and crossterm. It is built the same way as `connect` (`start_session` in
-  `main.rs`), so the two can't drift apart.
+### 3.11 TUI (`dvpn tui`)
+- **Two modes.** With the dvpn service installed (§3.12), the dashboard is one of its
+  clients: it runs without root and talks to the service over its socket. Without the
+  service (or with `--local`), the rest of this section applies: a single root process
+  runs the node, lending and the VPN client.
+- Both modes draw the same `View` and drive the same `Controller`
+  (`src/controller.rs`), in-process or over the socket. The in-process mode starts
+  sessions the same way as `connect` (`start_session` in `main.rs`), so the two can't
+  drift apart.
 - **Consent.** The first-run consent screen replaces `--accept-exit-risk`. Declining
   quits without changing anything.
 - **Lending** runs for the whole session.
@@ -344,7 +351,7 @@ exit too, and there is no way to connect without one.
 - **Starting it.** `dvpn` with no command is `dvpn tui`.
   - Started without root, `tui`, `install` and `uninstall` re-run themselves as
     `sudo <same binary> <same arguments>`, and say so first. Other commands never
-    escalate.
+    escalate. The dashboard doesn't escalate when the service is reachable.
   - The first run creates the identity. Any other identity problem, such as wrong
     permissions, still stops it.
 - **Install.** After consent, the TUI offers once to install the command
@@ -355,6 +362,65 @@ exit too, and there is no way to connect without one.
   - It is a copy rather than a link, so it survives moving or rebuilding the source.
     Updating it means running `dvpn install` again.
   - Declining is remembered in the data directory.
+
+### 3.12 Service and desktop app (`dvpn daemon`, `dvpn-gui`)
+The dashboard, `dvpn ctl` and the desktop app are unprivileged clients of one root
+service, so no user interface runs as root.
+
+- **Service.** `dvpn daemon` runs under systemd (`packaging/dvpn.service`), with its
+  data in `/var/lib/dvpn`.
+  - It starts at boot (and on demand through `dvpn.socket`), **idle**: no node, no
+    lending, nothing on the network until a client asks it to lend or connect.
+  - It owns one `Controller` and handles requests one at a time, so actions never race.
+  - **Lending on its own.** `Action::Lend` (the app's "Start lending", `dvpn ctl lend`,
+    `l` in the dashboard) starts lending without connecting the VPN, for users who want
+    to volunteer their connection. Exits only exist while someone lends, so this keeps
+    the network usable when few people are connected.
+    - It needs the same one-time consent, and uses the same limits as `connect`.
+    - Its exit record says `User`, as when connected. The kind is signed into the
+      record, so it can't change when the user later connects.
+  - **Lending at boot** (`Action::SetLendAtBoot`, saved as `lend_at_boot` in the
+    service's `config.json`) makes the service start lending by itself when it starts.
+    - Turning it on needs the lending terms accepted; a service that finds it on
+      without them stays idle and logs why.
+    - A failed start (the network may not be up yet at boot), or a node that stops
+      later, is retried every 30 s.
+    - "Turn off" stops that until the service starts again; turning the setting off
+      stops it for good. Changing the setting starts or stops nothing by itself.
+  - Lending also starts with the first connect, and stays up after a disconnect, as in
+    the dashboard. "Turn off" (`Action::Stop`) ends both.
+  - SIGTERM disconnects, stops lending, restores routes, DNS and the firewall, then
+    exits.
+  - At startup it removes firewall and routing rules a crashed predecessor left
+    behind (`lend::recover_stale_state`), unless another root `dvpn` is running.
+- **Control socket.** `/run/dvpn/control.sock`, created by systemd as `root:dvpn`, mode
+  0660. Being in the `dvpn` group is what grants control of the VPN.
+  - The protocol is one JSON request per line, each answered by one JSON line
+    (`control::Request` and `Response`).
+  - Requests can only choose among fixed `Action`s: accept the terms, lend, lend at
+    boot on/off, connect, disconnect, turn off, set the selection, measure, add a bootstrap peer. No paths,
+    commands or system settings pass through.
+  - A bootstrap address must parse as a multiaddr ending in `/p2p/<id>`. It is written
+    only to the service's own `config.json`.
+  - Request lines over 64 KiB close the connection. Each connection has its own task,
+    so one slow client can't block the others.
+  - The service's settings (DNS, rate limits, listen addresses) come from
+    `/etc/default/dvpn`, which only root can edit, not from the socket.
+- **Consent** is still required once per data directory. A client shows the terms,
+  and the service records acceptance only when asked to (`Action::AcceptExitRisk`).
+- **Packages** (`cargo deb`, `cargo deb -p dvpn-gui`):
+  - `dvpn` holds the binary, the units, the sysusers entry for the `dvpn` group and
+    `/etc/default/dvpn`. Installing it adds the installing user (from `SUDO_USER` or
+    `PKEXEC_UID`) to the group. Purging it deletes `/var/lib/dvpn`, including the
+    identity keys.
+  - `dvpn-gui` holds the Tauri app, its menu entry and an autostart entry.
+- **Desktop app** (`gui/`, Tauri 2): a tray icon and a window, both reading the
+  service's `View`.
+  - Closing the window keeps the tray icon. Quitting the app leaves the VPN running,
+    and the menu says so.
+  - At login, `--hidden` exits quietly if this account can't use the service.
+  - The frontend is static HTML, CSS and JS, with no npm build step. The webview's
+    CSP allows only the app's own files.
 
 ## 4. Stack
 
@@ -442,8 +508,7 @@ Notes:
 - Exit "family" declarations.
 - Bandwidth measurement and weighting.
 - Pluggable transports / bridges.
-- macOS / Windows / mobile.
-- GUI.
+- macOS / Windows / mobile (the Linux desktop app is in §3.12).
 - Incentives.
 
 ## 5a. Implementation notes (M1–M3)

@@ -1,0 +1,41 @@
+[Unit]
+Description=dvpn peer-to-peer VPN service
+Documentation=file:///usr/share/doc/dvpn/README.md
+# Started at boot, and on demand by dvpn.socket. It stays idle (nothing on the
+# network) unless a client asks it to lend or connect, or lending at boot is on.
+Requires=dvpn.socket
+After=dvpn.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Daemon options (e.g. DVPN_OPTS="--dns 1.1.1.1 --exit-rate-mbps 5"); see `dvpn daemon --help`.
+EnvironmentFile=-/etc/default/dvpn
+ExecStart=/usr/bin/dvpn --data-dir /var/lib/dvpn daemon $DVPN_OPTS
+StateDirectory=dvpn
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+# SIGTERM makes dvpn disconnect and restore routes, DNS and the firewall before exiting.
+TimeoutStopSec=30
+
+# Hardening that keeps what a VPN client and exit need: network administration,
+# /proc/sys/net (IPv4 forwarding), /dev/net/tun, `ip`, `nft` and systemd-resolved.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

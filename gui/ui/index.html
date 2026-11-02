@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dvpn</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="logo" aria-hidden="true"></span>dvpn</div>
+    <div class="who" id="who"></div>
+  </header>
+
+  <!-- Shown when the service can't be used -->
+  <section id="screen-absent" class="screen notice" hidden>
+    <h1>The dvpn service isn't running</h1>
+    <p>This app controls the dvpn service, which does the actual networking. Start it with:</p>
+    <pre>sudo systemctl enable --now dvpn.socket</pre>
+    <p class="muted">If it isn't installed, install the <code>dvpn</code> package first.</p>
+  </section>
+
+  <section id="screen-denied" class="screen notice" hidden>
+    <h1>This account can't control dvpn yet</h1>
+    <pre id="denied-help"></pre>
+  </section>
+
+  <section id="screen-error" class="screen notice" hidden>
+    <h1>Something went wrong</h1>
+    <p id="error-message"></p>
+  </section>
+
+  <!-- First run: lending is the price of using the network -->
+  <section id="screen-consent" class="screen" hidden>
+    <h1>Using dvpn means lending your connection</h1>
+    <p class="lead">Other users' traffic will leave the internet through your connection, while yours leaves through theirs.</p>
+    <div class="terms" id="terms"></div>
+    <div class="row">
+      <button class="primary" id="accept">Accept and continue</button>
+    </div>
+  </section>
+
+  <main id="screen-main" class="screen" hidden>
+    <section class="hero" id="hero">
+      <div class="state-ring" id="state-ring"><div class="state-dot"></div></div>
+      <div class="state-text">
+        <div class="state-title" id="vpn-title">Disconnected</div>
+        <div class="state-sub" id="vpn-sub"></div>
+      </div>
+      <button class="primary big" id="toggle">Connect</button>
+    </section>
+
+    <div class="banner warn" id="unprotected" hidden>Not protected yet: your traffic goes out normally until the first connection is up.</div>
+    <div id="warnings"></div>
+    <div class="banner error" id="error" hidden></div>
+
+    <section class="card" id="circuit-card" hidden>
+      <h2>Connection</h2>
+      <dl>
+        <dt>Tunnel IP</dt><dd id="c-ip"></dd>
+        <dt>Exit</dt><dd id="c-exit"></dd>
+        <dt>Relay</dt><dd id="c-relay"></dd>
+        <dt>Up for</dt><dd id="c-up"></dd>
+      </dl>
+    </section>
+
+    <section class="card">
+      <h2>Exit selection</h2>
+      <div class="segmented" role="radiogroup" aria-label="How exits are chosen">
+        <button role="radio" id="mode-random">Random</button>
+        <button role="radio" id="mode-ping">Max ping</button>
+      </div>
+      <p class="hint" id="mode-hint"></p>
+      <div id="ping-controls" hidden>
+        <div class="row">
+          <input type="range" id="ping-range" min="10" max="500" step="10" aria-label="Ping limit">
+          <span class="ping-value"><input type="number" id="ping-input" min="1" max="60000" step="10"> ms</span>
+        </div>
+        <p class="hint" id="availability"></p>
+        <button class="secondary" id="measure">Measure exits</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Lending</h2>
+      <div class="lending-state" id="lending-state"></div>
+      <p class="hint" id="lend-hint" hidden>You can lend your connection without using the VPN yourself. It helps others connect, especially while few people are online.</p>
+      <button class="primary" id="lend" hidden>Start lending</button>
+      <label class="check"><input type="checkbox" id="lend-at-boot"> Start lending when this computer starts</label>
+      <p class="hint" id="lend-at-boot-hint" hidden>dvpn lends from every start of this computer. Turn off stops it until the next start; untick this to stop for good.</p>
+      <dl id="lending-details" hidden>
+        <dt>Reachable</dt><dd id="l-reach"></dd>
+        <dt>Sessions</dt><dd id="l-sessions"></dd>
+        <dt>Limit</dt><dd id="l-limit"></dd>
+        <dt>Interface</dt><dd id="l-wan"></dd>
+        <dt>Network</dt><dd id="l-net"></dd>
+      </dl>
+      <button class="secondary danger" id="off" hidden>Turn off (stop lending)</button>
+    </section>
+
+    <details class="card" id="network-card">
+      <summary><h2>Bootstrap peer</h2></summary>
+      <p class="hint">The first time, dvpn needs the address of one peer it can reach, ending in <code>/p2p/&lt;peer-id&gt;</code>. After that it remembers the peers it found.</p>
+      <form class="row" id="bootstrap-form">
+        <input type="text" id="bootstrap" placeholder="/ip4/203.0.113.7/tcp/4001/p2p/12D3KooW…" spellcheck="false" autocomplete="off">
+        <button class="secondary" type="submit">Add</button>
+      </form>
+      <p class="hint" id="bootstrap-result"></p>
+    </details>
+
+    <details class="card">
+      <summary><h2>Log</h2></summary>
+      <pre class="log" id="log"></pre>
+    </details>
+  </main>
+</body>
+</html>

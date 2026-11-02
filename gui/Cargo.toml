@@ -1,0 +1,40 @@
+[package]
+name = "dvpn-gui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Desktop app for the dvpn peer-to-peer VPN"
+publish = false
+
+[[bin]]
+name = "dvpn-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dependencies]
+dvpn = { path = ".." }
+serde = { version = "1.0.229", features = ["derive"] }
+tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
+tokio = { version = "1.54.1", features = ["time"] }
+
+[package.metadata.deb]
+name = "dvpn-gui"
+maintainer = "Pharell Jay Jeyakumar <pharelljeyakumar1010@gmail.com>"
+copyright = "2026, Pharell Jay Jeyakumar"
+license-file = ["../LICENSE", "0"]
+section = "net"
+priority = "optional"
+extended-description = """\
+Desktop app for dvpn: connect and disconnect from the tray, choose how exits are \
+picked, and see whether your connection is being lent to others. Needs the dvpn \
+service package."""
+# The tray icon library is loaded at runtime, so it isn't found automatically.
+depends = "$auto, dvpn (= 0.1.0-1), libayatana-appindicator3-1"
+assets = [
+    ["target/release/dvpn-gui", "usr/bin/", "755"],
+    ["packaging/dvpn.desktop", "usr/share/applications/", "644"],
+    ["packaging/dvpn-autostart.desktop", "etc/xdg/autostart/dvpn-gui.desktop", "644"],
+    ["icons/icon.png", "usr/share/icons/hicolor/512x512/apps/dvpn.png", "644"],
+]

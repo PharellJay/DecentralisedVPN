@@ -51,7 +51,8 @@ pub enum RecordError {
 pub enum ExitKind {
     /// `dvpn run --exit`: lends without using the VPN.
     Dedicated,
-    /// `dvpn connect`: a user lending while connected. Used only when no dedicated exit fits.
+    /// A user's machine (`dvpn connect`, the dashboard, the service), lending whether it is
+    /// connected or lends on its own. Used only when no dedicated exit fits.
     User,
 }
 

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=dvpn
+Comment=dvpn tray icon
+Exec=dvpn-gui --hidden
+Icon=dvpn
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

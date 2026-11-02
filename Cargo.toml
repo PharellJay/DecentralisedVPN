@@ -5,6 +5,11 @@ edition = "2024"
 license = "MIT"
 description = "Decentralised peer-to-peer VPN"
 
+[workspace]
+# The desktop app. Plain `cargo build` / `cargo test` here build only dvpn itself, so
+# working on it doesn't need the app's WebKitGTK headers.
+members = ["gui"]
+
 [[bin]]
 name = "dvpn"
 path = "src/main.rs"
@@ -49,3 +54,34 @@ zeroize = "1.9.1"
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["test-util"] }
+
+[package.metadata.deb]
+maintainer = "Pharell Jay Jeyakumar <pharelljeyakumar1010@gmail.com>"
+copyright = "2026, Pharell Jay Jeyakumar"
+license-file = ["LICENSE", "0"]
+section = "net"
+priority = "optional"
+extended-description = """\
+A peer-to-peer VPN with no central server. Your traffic leaves the internet from \
+another peer's IP address, routed through two hops so no single peer sees both who \
+you are and where you're going. Using it means lending your own connection as an exit \
+for others in return.
+
+This package runs dvpn as a systemd service, idle until it is asked to lend or \
+connect, or set to lend from boot. Members of the dvpn \
+group control it with the `dvpn` dashboard or `dvpn ctl`, without sudo."""
+depends = "$auto, iproute2, nftables, systemd"
+recommends = "systemd-resolved"
+maintainer-scripts = "packaging/debian/"
+assets = [
+    ["target/release/dvpn", "usr/bin/", "755"],
+    ["packaging/default", "etc/default/dvpn", "644"],
+    ["scripts/exit-teardown.sh", "usr/share/dvpn/", "755"],
+    ["README.md", "usr/share/doc/dvpn/", "644"],
+    ["docs/DESIGN.md", "usr/share/doc/dvpn/", "644"],
+]
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "packaging/"
+enable = true
+start = true

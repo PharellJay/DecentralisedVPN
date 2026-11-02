@@ -7,7 +7,7 @@ use anyhow::{Context, bail};
 use libp2p::Multiaddr;
 use libp2p::PeerId;
 use libp2p::multiaddr::Protocol;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE: &str = "config.json";
 
@@ -19,11 +19,13 @@ pub fn default_data_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Optional `<data-dir>/config.json`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
     /// Bootstrap peers as multiaddrs ending in `/p2p/<peer-id>`.
     pub bootstrap: Vec<String>,
+    /// The service (`dvpn daemon`) starts lending when it starts, i.e. at boot.
+    pub lend_at_boot: bool,
 }
 
 impl FileConfig {
@@ -34,6 +36,14 @@ impl FileConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    /// Writes `<data-dir>/config.json` (owner-only, replaced atomically).
+    pub fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
+        let path = data_dir.join(CONFIG_FILE);
+        let mut json = serde_json::to_vec_pretty(self)?;
+        json.push(b'\n');
+        crate::identity::write_private(&path, &json).with_context(|| format!("writing {}", path.display()))
     }
 }
 

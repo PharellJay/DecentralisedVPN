@@ -15,8 +15,11 @@ use anyhow::Context;
 pub const INSTALL_PATH: &str = "/usr/local/bin/dvpn";
 const DECLINED_FILE: &str = "install-declined";
 
+/// Where the Debian package puts the command.
+pub const PACKAGED_PATH: &str = "/usr/bin/dvpn";
+
 pub fn is_installed() -> bool {
-    Path::new(INSTALL_PATH).exists()
+    Path::new(INSTALL_PATH).exists() || Path::new(PACKAGED_PATH).exists()
 }
 
 /// Copies the running executable to [`INSTALL_PATH`] (needs root).
