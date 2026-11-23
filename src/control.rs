@@ -38,7 +38,7 @@ const MAX_REQUEST: u64 = 64 * 1024;
 pub enum Request {
     /// The node's [`StatusReport`].
     Status,
-    /// The service's whole state, as shown by its dashboards (`dvpn daemon` only).
+    /// The service's whole state, as shown by the app (`dvpn daemon` only).
     View,
     /// Something the user wants done (`dvpn daemon` only).
     Act(Action),

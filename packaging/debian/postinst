@@ -18,7 +18,7 @@ if [ "$1" = "configure" ]; then
     if [ -n "$installer" ] && [ "$installer" != "root" ] && id "$installer" >/dev/null 2>&1; then
         if ! id -nG "$installer" | tr ' ' '\n' | grep -qx dvpn; then
             usermod -aG dvpn "$installer"
-            echo "dvpn: added $installer to the dvpn group. Log out and back in, then run \`dvpn\` or open the dvpn app."
+            echo "dvpn: added $installer to the dvpn group. Log out and back in, then open the dvpn app."
         fi
     else
         echo "dvpn: to control the VPN without sudo, add yourself to the dvpn group: sudo usermod -aG dvpn \$USER"

@@ -19,13 +19,20 @@ pub fn default_data_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Optional `<data-dir>/config.json`.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
     /// Bootstrap peers as multiaddrs ending in `/p2p/<peer-id>`.
     pub bootstrap: Vec<String>,
     /// The service (`dvpn daemon`) starts lending when it starts, i.e. at boot.
+    /// On unless the user turns it off; it still waits for the lending terms.
     pub lend_at_boot: bool,
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self { bootstrap: Vec::new(), lend_at_boot: true }
+    }
 }
 
 impl FileConfig {
@@ -53,5 +60,20 @@ pub fn split_peer_addr(addr: &Multiaddr) -> anyhow::Result<(PeerId, Multiaddr)> 
     match transport.pop() {
         Some(Protocol::P2p(peer_id)) => Ok((peer_id, transport)),
         _ => bail!("bootstrap address {addr} must end with /p2p/<peer-id>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lend_at_boot_is_on_unless_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(FileConfig::load(dir.path()).unwrap().lend_at_boot, "no config.json");
+        fs::write(dir.path().join(CONFIG_FILE), r#"{"bootstrap": []}"#).unwrap();
+        assert!(FileConfig::load(dir.path()).unwrap().lend_at_boot, "field left out");
+        fs::write(dir.path().join(CONFIG_FILE), r#"{"lend_at_boot": false}"#).unwrap();
+        assert!(!FileConfig::load(dir.path()).unwrap().lend_at_boot, "turned off");
     }
 }

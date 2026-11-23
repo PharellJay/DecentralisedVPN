@@ -44,9 +44,13 @@ const PREF_BYPASS: &str = "7701";
 /// Shown before lending is enabled for the first time. Calm, but every sentence must
 /// stay true for the actual exit policy (docs/DESIGN.md §3.6).
 pub const LENDING_WARNING: &str = "\
-While you use dvpn, other users' traffic leaves the internet through your connection,
-just as yours leaves through theirs. dvpn prefers dedicated exits and only sends
-others through you when none of those suits them.
+Other users' traffic leaves the internet through your connection, just as yours leaves
+through theirs. dvpn prefers dedicated exits and only sends others through you when
+none of those suits them.
+
+dvpn lends while you're connected, or when you choose to lend. The dvpn service, which
+the app uses, also lends from every start of this computer, even when you aren't
+connected. To stop that, untick \"Start lending when this computer starts\" in the app.
 
 Your exit never lets anyone reach your home network or this computer, and it blocks
 direct connections to mail servers, the usual route for spam. dvpn keeps no logs of
@@ -280,8 +284,7 @@ pub fn recover_stale_state() -> anyhow::Result<()> {
 
 /// Whether another root process named `dvpn` shares our network namespace (needs root
 /// to read other processes' namespaces, which lending has). Unprivileged `dvpn`
-/// processes (the dashboard or `dvpn ctl` talking to the service) can't lend, so they
-/// don't count.
+/// processes can't lend, so they don't count.
 fn other_dvpn_in_this_namespace() -> bool {
     use std::os::unix::fs::MetadataExt;
     let ours = std::fs::read_link("/proc/self/ns/net").ok();

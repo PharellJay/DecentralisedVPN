@@ -1,8 +1,8 @@
 //! What a user can do with dvpn while it runs (accept the lending terms, connect,
 //! disconnect, turn off, choose exits), and the [`View`] of its state.
 //!
-//! Shared by the in-process dashboard (`sudo dvpn tui`) and the background service
-//! (`dvpn daemon`), whose clients send [`Action`]s over the control socket.
+//! Used by the background service (`dvpn daemon`), whose client (the desktop app) sends
+//! [`Action`]s over the control socket.
 //!
 //! Lending starts with [`Action::Lend`] (lending on its own, without the VPN) or with the
 //! first connect, and keeps running after a disconnect; [`Action::Stop`] turns both off.
@@ -380,7 +380,7 @@ impl Controller {
         Ok(())
     }
 
-    /// Collects finished background work. Call regularly (the dashboard does on every tick).
+    /// Collects finished background work. Call regularly (the service does on every tick).
     pub async fn poll(&mut self) {
         if self.client.as_ref().is_some_and(JoinHandle::is_finished) {
             let task = self.client.take().expect("checked");

@@ -1,4 +1,4 @@
-# Shared helpers for scripts/netns-test.sh and scripts/netns-demo.sh: building a fake
+# Shared helpers for scripts/netns-test.sh: building a fake
 # internet out of network namespaces (all prefixed dvt-). Source it; don't run it.
 #
 #   dvt-core: router between the 198.51.100.0/24 "internet" bridge (br0, .1) and the

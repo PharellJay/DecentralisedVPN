@@ -1,5 +1,4 @@
-//! `dvpn daemon`: the background service behind the desktop app and the unprivileged
-//! dashboard.
+//! `dvpn daemon`: the background service behind the desktop app.
 //!
 //! It runs as root (under systemd, `packaging/dvpn.service`, started at boot) and does
 //! nothing on the network until a client asks it to lend or connect, or, with lending
@@ -92,7 +91,7 @@ async fn keep_lending(controller: &mut Controller, lend_at: &mut Option<Instant>
         return;
     }
     if !controller.consent_given() {
-        warn!("lending at boot is on, but the lending terms haven't been accepted yet");
+        info!("lending at boot waits until the lending terms are accepted");
         *lend_at = None;
         return;
     }

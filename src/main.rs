@@ -8,11 +8,10 @@ use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use dvpn::client::{self, ConnectOptions};
 use dvpn::config::{FileConfig, default_data_dir};
-use dvpn::control::{self, Client, Phase, Request, Response, SharedState};
-use dvpn::controller::{Action, Controller, Session, StartFn, View};
+use dvpn::control::{self, Client, Request, Response, SharedState};
+use dvpn::controller::{Controller, Session, StartFn};
 use dvpn::daemon::{self, Probe, SERVICE_DATA_DIR, SERVICE_SOCKET};
 use dvpn::identity::{Identity, IdentityError};
-use dvpn::install;
 use dvpn::lend::{self, LendOptions, Lending};
 use dvpn::logs::LogBuffer;
 use dvpn::node::{self, ExitConfig, Node, NodeConfig, Reachability};
@@ -20,14 +19,18 @@ use dvpn::policy::DEFAULT_BLOCKED_TCP_PORTS;
 use dvpn::records::ExitKind;
 use dvpn::select::Selection;
 use dvpn::system;
-use dvpn::tui::{self, Backend};
 use ipnet::Ipv4Net;
 use libp2p::Multiaddr;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 #[derive(Parser)]
-#[command(version, about = "Decentralised peer-to-peer VPN. Without a command, starts the dashboard (tui).")]
+#[command(
+    version,
+    about = "The dvpn service, used by the dvpn app. Not meant to be run by hand: systemd starts \
+             `daemon`, and the other commands are for servers (bootstrap peers, dedicated exits) \
+             and the end-to-end tests."
+)]
 struct Cli {
     /// Directory holding keys, config and peer cache [default: ~/.local/share/dvpn]
     #[arg(long, global = true)]
@@ -38,7 +41,7 @@ struct Cli {
     debug: bool,
 
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Args, Clone)]
@@ -136,17 +139,8 @@ enum Command {
     /// Route this machine's traffic through the network while lending your IP as an
     /// exit in return (needs root)
     Connect(ConnectArgs),
-    /// Terminal dashboard: lend, connect and choose exits interactively. Uses the dvpn
-    /// service when it's installed; otherwise runs in-process (needs root)
-    Tui {
-        #[command(flatten)]
-        args: ConnectArgs,
-        /// Run in-process even if the dvpn service is installed (needs root)
-        #[arg(long)]
-        local: bool,
-    },
-    /// Run as the background service that the desktop app, `dvpn ctl` and the dashboard
-    /// control (needs root; normally started by systemd). Idle until a client connects
+    /// Run as the background service that the desktop app controls (needs root;
+    /// started by systemd). Idle until the app asks it to lend or connect
     Daemon {
         #[command(flatten)]
         args: ConnectArgs,
@@ -154,102 +148,24 @@ enum Command {
         #[arg(long, default_value = SERVICE_SOCKET)]
         socket: PathBuf,
     },
-    /// Control the dvpn service from the command line
-    Ctl {
-        #[command(subcommand)]
-        command: CtlCommand,
-        /// The service's control socket
-        #[arg(long, default_value = SERVICE_SOCKET)]
-        socket: PathBuf,
-    },
     /// Show the state of the running node (the service's, if it's installed)
     Status,
-    /// Install the dvpn command to /usr/local/bin, so `dvpn` starts the dashboard from
-    /// any terminal (needs root)
-    Install,
-    /// Remove the installed dvpn command (keys and settings are kept)
-    Uninstall,
-}
-
-#[derive(Subcommand)]
-enum CtlCommand {
-    /// Show what the service is doing
-    Status {
-        /// Print the full state as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Lend your connection to others without connecting the VPN yourself
-    Lend,
-    /// Whether the service starts lending when the computer starts
-    LendAtBoot {
-        #[arg(value_parser = ["on", "off"])]
-        state: String,
-    },
-    /// Start lending (if needed) and connect the VPN
-    Connect,
-    /// Disconnect the VPN; lending keeps running
-    Disconnect,
-    /// Disconnect and stop lending
-    Off,
-    /// Pick any exit at random (the most private)
-    Random,
-    /// Pick a random exit among those within this round-trip time
-    MaxPing {
-        #[arg(value_parser = clap::value_parser!(u64).range(1..=60_000))]
-        ms: u64,
-    },
-    /// Measure exits again
-    Measure,
-    /// Accept the lending terms (shown with `dvpn ctl terms`)
-    AcceptExitRisk,
-    /// Show the lending terms
-    Terms,
-    /// Remember a bootstrap peer (ending in /p2p/<peer-id>); used from the next start
-    AddBootstrap { addr: String },
-    /// Show the service's recent log
-    Logs,
-}
-
-impl Command {
-    /// Commands re-run themselves through sudo when started without root.
-    fn escalates(&self) -> bool {
-        matches!(self, Self::Tui { .. } | Self::Install | Self::Uninstall)
-    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut cli = Cli::parse();
-    // Bare `dvpn` starts the dashboard with its default options.
-    let implicit_tui = cli.command.is_none();
-    if implicit_tui {
-        cli = Cli::parse_from(std::env::args_os().chain(["tui".into()]));
-    }
-    let command = cli.command.expect("set above");
-    // With the service installed, the dashboard is its client and needs no root.
-    let service = match &command {
-        Command::Tui { local: false, .. } if cli.data_dir.is_none() => daemon::probe(Path::new(SERVICE_SOCKET)).await,
-        _ => Probe::Absent,
-    };
-    if let Probe::PermissionDenied = service {
-        bail!("{}\n\nOr run the dashboard without the service: sudo dvpn tui --local", daemon::permission_help());
-    }
-    if command.escalates() && !is_root() && !matches!(service, Probe::Available(_)) {
-        return Err(rerun_with_sudo(implicit_tui));
-    }
+    let cli = Cli::parse();
+    let command = cli.command;
     // Third-party crates stay at `warn` even with --debug, since their debug output includes addresses.
     // libp2p_kad warns on every first start with an empty routing table, which is expected.
     let filter = if cli.debug { "dvpn=debug,libp2p_kad=error,warn" } else { "dvpn=info,libp2p_kad=error,warn" };
-    // The TUI owns the terminal, so its log lines go to its log panel instead; the
-    // service logs to the journal and keeps recent lines for its clients.
+    // The service logs to the journal and keeps recent lines for the app.
     let logs = LogBuffer::default();
     let to_buffer = tracing_subscriber::fmt::layer()
         .with_writer(logs.clone())
         .with_ansi(false)
         .without_time();
     match &command {
-        Command::Tui { .. } => tracing_subscriber::registry().with(to_buffer).with(EnvFilter::new(filter)).init(),
         Command::Daemon { .. } => {
             let journal = tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal());
             tracing_subscriber::registry()
@@ -344,27 +260,6 @@ async fn main() -> anyhow::Result<()> {
             drop(lending);
             outcome?;
         }
-        Command::Tui { args, .. } => {
-            if let Probe::Available(stream) = service {
-                // Consent is asked on the TUI's own screen; `--accept-exit-risk` skips it.
-                let mut setup = Vec::new();
-                if args.lend.accept_exit_risk {
-                    setup.push(Action::AcceptExitRisk);
-                }
-                setup.extend(args.net.bootstrap.iter().map(|addr| Action::AddBootstrap { addr: addr.to_string() }));
-                if let Some(ms) = args.max_ping {
-                    setup.push(Action::SetSelection { max_ping_ms: Some(ms) });
-                }
-                tui::run(&data_dir, Backend::Service(Client::new(stream)), setup).await?;
-            } else {
-                if args.lend.accept_exit_risk && !lend::consent_given(&data_dir) {
-                    lend::record_consent(&data_dir)?;
-                }
-                // Any problem with the identity stops us before the terminal is taken over.
-                let controller = controller(&data_dir, args, logs, true)?;
-                tui::run(&data_dir, Backend::Local(Box::new(controller)), Vec::new()).await?;
-            }
-        }
         Command::Daemon { args, socket } => {
             // Before any system changes, so a signal during setup still cleans up.
             let shutdown = system::shutdown_signal()?;
@@ -376,19 +271,10 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = lend::recover_stale_state() {
                 tracing::warn!("{e:#}");
             }
-            let controller = controller(&data_dir, args, logs, false)?;
+            let controller = controller(&data_dir, args, logs)?;
             let listener = daemon::listen(&socket).await?;
             daemon::run(controller, listener, shutdown).await;
         }
-        Command::Ctl { command, socket } => ctl(&socket, command).await?,
-        Command::Install => {
-            let path = install::install()?;
-            println!("installed {}; start the dashboard from any terminal with `dvpn`", path.display());
-        }
-        Command::Uninstall => match install::uninstall()? {
-            true => println!("removed {}", install::INSTALL_PATH),
-            false => println!("{} was not installed", install::INSTALL_PATH),
-        },
         Command::Status => {
             // Without --data-dir, the service's node if it runs, else this user's.
             let service = match cli_had_data_dir {
@@ -410,32 +296,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The effective user owns `/proc/self`.
-fn is_root() -> bool {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
-}
-
-/// Replaces this process with `sudo <this binary> <same arguments>`; returns only on failure.
-fn rerun_with_sudo(implicit_tui: bool) -> anyhow::Error {
-    use std::os::unix::process::CommandExt;
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return anyhow::Error::new(e).context("finding the running executable"),
-    };
-    eprintln!("dvpn needs root to set up network devices; running it with sudo");
-    let mut sudo = std::process::Command::new("sudo");
-    sudo.arg("--").arg(exe).args(std::env::args_os().skip(1));
-    if implicit_tui {
-        sudo.arg("tui");
-    }
-    anyhow::Error::new(sudo.exec()).context("running sudo (or run dvpn as root)")
-}
-
-/// A controller for the in-process dashboard (`status_socket`: it serves
-/// `<data-dir>/control.sock` while lending) or the service (which has its own socket).
-/// Creates the identity on first use.
-fn controller(data_dir: &Path, args: ConnectArgs, logs: LogBuffer, status_socket: bool) -> anyhow::Result<Controller> {
+/// The service's controller. Creates the identity on first use.
+fn controller(data_dir: &Path, args: ConnectArgs, logs: LogBuffer) -> anyhow::Result<Controller> {
     parse_dns(&args.dns)?; // Checked now rather than at the first connect.
     let identity = match Identity::load(data_dir) {
         Ok(identity) => identity,
@@ -449,7 +311,8 @@ fn controller(data_dir: &Path, args: ConnectArgs, logs: LogBuffer, status_socket
     let dir = data_dir.to_path_buf();
     let start: StartFn = Box::new(move || {
         let (dir, args) = (dir.clone(), args.clone());
-        Box::pin(async move { start_session(&dir, args, status_socket).await })
+        // The service has its own socket, so no `<data-dir>/control.sock`.
+        Box::pin(async move { start_session(&dir, args, false).await })
     });
     Ok(Controller::new(data_dir, identity.peer_id().to_string(), selection, logs, start))
 }
@@ -461,7 +324,7 @@ fn parse_dns(dns: &str) -> anyhow::Result<Option<Ipv4Addr>> {
     }
 }
 
-/// Starts the node and lending for `connect`, `tui` and the service, and with
+/// Starts the node and lending for `connect` and the service, and with
 /// `status_socket` the `<data-dir>/control.sock` status socket.
 async fn start_session(data_dir: &Path, args: ConnectArgs, status_socket: bool) -> anyhow::Result<Session> {
     let dns = parse_dns(&args.dns)?;
@@ -508,94 +371,6 @@ async fn start_session(data_dir: &Path, args: ConnectArgs, status_socket: bool) 
         },
         status_server,
     })
-}
-
-/// `dvpn ctl`: one request to the service.
-async fn ctl(socket: &Path, command: CtlCommand) -> anyhow::Result<()> {
-    if let CtlCommand::Terms = command {
-        println!("{}", lend::LENDING_WARNING);
-        return Ok(());
-    }
-    let mut client = match daemon::probe(socket).await {
-        Probe::Available(stream) => Client::new(stream),
-        Probe::PermissionDenied => bail!("{}", daemon::permission_help()),
-        Probe::Absent => bail!("the dvpn service isn't running (start it with `sudo systemctl start dvpn`)"),
-    };
-    let action = match command {
-        CtlCommand::Status { json } => {
-            let mut view = client.view().await?;
-            view.logs.clear();
-            match json {
-                true => println!("{}", serde_json::to_string_pretty(&view)?),
-                false => print!("{}", summary(&view)),
-            }
-            return Ok(());
-        }
-        CtlCommand::Logs => {
-            for line in client.view().await?.logs {
-                println!("{line}");
-            }
-            return Ok(());
-        }
-        CtlCommand::Terms => unreachable!("handled above"),
-        CtlCommand::Lend => Action::Lend,
-        CtlCommand::LendAtBoot { state } => Action::SetLendAtBoot { enabled: state == "on" },
-        CtlCommand::Connect => Action::Connect,
-        CtlCommand::Disconnect => Action::Disconnect,
-        CtlCommand::Off => Action::Stop,
-        CtlCommand::Random => Action::SetSelection { max_ping_ms: None },
-        CtlCommand::MaxPing { ms } => Action::SetSelection { max_ping_ms: Some(ms) },
-        CtlCommand::Measure => Action::Measure,
-        CtlCommand::AcceptExitRisk => Action::AcceptExitRisk,
-        CtlCommand::AddBootstrap { addr } => Action::AddBootstrap { addr },
-    };
-    let needs_consent = matches!(action, Action::Connect | Action::Lend | Action::SetLendAtBoot { enabled: true });
-    if needs_consent && !client.view().await?.consent_given {
-        let again = match action {
-            Action::Connect => "connect",
-            _ => "try",
-        };
-        bail!(
-            "using dvpn means lending your connection to others first:\n\n{}\n\n\
-             To accept, run `dvpn ctl accept-exit-risk`, then {again} again.",
-            lend::LENDING_WARNING
-        );
-    }
-    client.act(action).await
-}
-
-/// `dvpn ctl status`, for people.
-fn summary(view: &View) -> String {
-    let lending = match (view.running, view.lending.ready) {
-        (false, _) => "off".to_string(),
-        (true, true) => format!("ready ({} of {} sessions)", view.lending.sessions, view.lending.max_sessions),
-        (true, false) => "starting".to_string(),
-    };
-    let vpn = match (view.vpn.running, view.vpn.phase) {
-        (false, _) => "disconnected",
-        (true, Phase::Idle) => "starting",
-        (true, Phase::WaitingForLending) => "waiting for lending",
-        (true, Phase::Connecting) => "connecting (not protected yet)",
-        (true, Phase::Connected) => "connected",
-        (true, Phase::Reconnecting) => "reconnecting (traffic blocked)",
-        (true, Phase::Paused) => "paused: lending is down (traffic blocked)",
-    };
-    let at_boot = if view.lend_at_boot { "on" } else { "off" };
-    let mut out = format!("lending  {lending} (at boot: {at_boot})\nvpn      {vpn}\n");
-    if let Some(c) = view.circuit_if_connected() {
-        out += &format!("tunnel   {} via exit {}\n", c.assigned_ip, c.exit);
-    }
-    out += &format!("exits    {}\n", view.selection);
-    if !view.consent_given {
-        out += "\nThe lending terms haven't been accepted yet: see `dvpn ctl terms`.\n";
-    }
-    for warning in &view.vpn.warnings {
-        out += &format!("warning  {warning}\n");
-    }
-    if let Some(error) = view.error.as_ref().or(view.vpn.last_error.as_ref()) {
-        out += &format!("error    {error}\n");
-    }
-    out
 }
 
 /// Settings shared by `run` and `connect`.

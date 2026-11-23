@@ -1,4 +1,4 @@
-//! Recent log lines kept in memory, so the dashboard and the service's clients can
+//! Recent log lines kept in memory, so the service's clients (the app) can
 //! show them. `tracing` writes into a [`LogBuffer`] through [`MakeWriter`].
 
 use std::collections::VecDeque;

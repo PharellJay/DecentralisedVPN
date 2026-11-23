@@ -21,6 +21,8 @@ async fn service_takes_actions_and_reports_failures_to_clients() {
     let data_dir = dir.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
     let socket = dir.path().join("run/control.sock");
+    // Only what clients ask for: lending at boot (on by default) would race the counts below.
+    FileConfig { lend_at_boot: false, ..FileConfig::default() }.save(&data_dir).unwrap();
 
     let starts = Arc::new(AtomicUsize::new(0));
     let start: StartFn = Box::new({

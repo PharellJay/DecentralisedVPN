@@ -9,9 +9,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Daemon options (e.g. DVPN_OPTS="--dns 1.1.1.1 --exit-rate-mbps 5"); see `dvpn daemon --help`.
+# Daemon options (e.g. DVPN_OPTS="--dns 1.1.1.1 --exit-rate-mbps 5"); see /etc/default/dvpn.
 EnvironmentFile=-/etc/default/dvpn
-ExecStart=/usr/bin/dvpn --data-dir /var/lib/dvpn daemon $DVPN_OPTS
+ExecStart=/usr/libexec/dvpn/dvpn --data-dir /var/lib/dvpn daemon $DVPN_OPTS
 StateDirectory=dvpn
 StateDirectoryMode=0700
 Restart=on-failure
