@@ -2,6 +2,7 @@
 
 use std::net::Ipv4Addr;
 
+pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
 

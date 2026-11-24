@@ -4,7 +4,7 @@
 #   - NATs the exit's client pool (10.77.0.0/16) out of <wan-interface>,
 #   - lets client traffic leave only through <wan-interface>, never to private ranges
 #     or SMTP, and never to services on this host.
-# dvpn applies these same rules itself when lending starts (src/lend.rs) and removes
+# dvpn applies these same rules itself when lending starts (src/platform/linux/exit.rs) and removes
 # them when it stops, so you don't need this script to run an exit. It's here to review
 # or apply the rules by hand; dvpn refuses to start while this table exists. Run as root.
 #
@@ -28,6 +28,11 @@ sysctl -qw net.ipv4.ip_forward=1
 
 nft -f - <<EOF
 table ip dvpn {
+    # dvpn adds this exit's public address(es) here, so clients can't reach the LAN
+    # through hairpin NAT on the router. Add yours by hand: nft add element ip dvpn self_deny { <ip> }
+    set self_deny {
+        type ipv4_addr
+    }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
         ip saddr $POOL oifname "$WAN" masquerade
@@ -35,7 +40,8 @@ table ip dvpn {
     chain forward {
         type filter hook forward priority filter; policy accept;
         iifname "$TUN" oifname != "$WAN" drop
-        iifname "$TUN" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } drop
+        iifname "$TUN" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 } drop
+        iifname "$TUN" ip daddr @self_deny drop
         iifname "$TUN" tcp dport 25 drop
         oifname "$TUN" ct state established,related accept
         oifname "$TUN" drop

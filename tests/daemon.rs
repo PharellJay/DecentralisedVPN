@@ -32,10 +32,10 @@ async fn service_takes_actions_and_reports_failures_to_clients() {
             Box::pin(async { anyhow::bail!("creating the exit TUN device: needs root") })
         }
     });
-    let controller = Controller::new(&data_dir, "12D3KooWTest".into(), Selection::Random, LogBuffer::default(), start);
+    let controller = Controller::new(&data_dir, Selection::Random, LogBuffer::default(), start);
     let listener = daemon::listen(&socket).await.unwrap();
     let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o660, "only root and the dvpn group may control the service");
+    assert_eq!(mode, 0o666, "anyone may connect; the service decides whom it answers");
 
     let (stop, stopped) = oneshot::channel::<()>();
     let service = tokio::spawn(daemon::run(controller, listener, async {
@@ -85,6 +85,18 @@ async fn service_takes_actions_and_reports_failures_to_clients() {
     client.act(Action::AddBootstrap { addr: BOOTSTRAP.into() }).await.unwrap();
     client.act(Action::AddBootstrap { addr: BOOTSTRAP.into() }).await.unwrap();
     assert_eq!(FileConfig::load(&data_dir).unwrap().bootstrap, [BOOTSTRAP]);
+    assert_eq!(client.view().await.unwrap().bootstrap, [BOOTSTRAP], "listed in the app");
+    client.act(Action::RemoveBootstrap { addr: BOOTSTRAP.into() }).await.unwrap();
+    assert!(FileConfig::load(&data_dir).unwrap().bootstrap.is_empty());
+    assert!(client.view().await.unwrap().bootstrap.is_empty());
+
+    // An invite link adds all its peers at once.
+    let other = "/ip4/198.51.100.3/udp/4001/quic-v1/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA";
+    let link = format!("dvpn://join?peer={BOOTSTRAP}&peer={other}");
+    client.act(Action::AddBootstrap { addr: link }).await.unwrap();
+    assert_eq!(FileConfig::load(&data_dir).unwrap().bootstrap, [BOOTSTRAP, other]);
+    client.act(Action::RemoveBootstrap { addr: other.into() }).await.unwrap();
+    client.act(Action::RemoveBootstrap { addr: BOOTSTRAP.into() }).await.unwrap();
 
     // Several clients at once; garbage gets an error, not a crash.
     let mut second = Client::connect(&socket).await.unwrap();
@@ -116,7 +128,7 @@ async fn failing_service(
             Box::pin(async { anyhow::bail!("creating the exit TUN device: needs root") })
         }
     });
-    let controller = Controller::new(data_dir, "12D3KooWTest".into(), Selection::Random, LogBuffer::default(), start);
+    let controller = Controller::new(data_dir, Selection::Random, LogBuffer::default(), start);
     let listener = daemon::listen(socket).await.unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
     let service = tokio::spawn(daemon::run(controller, listener, async {
@@ -184,4 +196,64 @@ async fn lending_at_boot_needs_the_terms() {
 
     stop.send(()).unwrap();
     service.await.unwrap();
+}
+
+#[tokio::test]
+async fn watchers_get_changes_and_new_log_lines_pushed() {
+    use std::io::Write;
+    use std::time::Duration;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    let socket = dir.path().join("run/control.sock");
+    FileConfig { lend_at_boot: false, ..FileConfig::default() }.save(&data_dir).unwrap();
+    let logs = LogBuffer::default();
+    writeln!(logs.make_writer(), "before watching").unwrap();
+    let start: StartFn = Box::new(|| Box::pin(async { anyhow::bail!("needs root") }));
+    let controller = Controller::new(&data_dir, Selection::Random, logs.clone(), start);
+    let listener = daemon::listen(&socket).await.unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let service = tokio::spawn(daemon::run(controller, listener, async {
+        let _ = stopped.await;
+    }));
+
+    // First: the whole state, and the recent log.
+    let mut watcher = Client::connect(&socket).await.unwrap().watch(true).await.unwrap();
+    let first = next(&mut watcher).await;
+    let view = first.view.expect("the state comes first");
+    assert_eq!(view.selection, Selection::Random);
+    assert!(view.logs.is_empty(), "log lines come separately");
+    assert_eq!(first.logs, ["before watching"]);
+
+    // A change made by another client is pushed, without asking.
+    let mut client = Client::connect(&socket).await.unwrap();
+    client.act(Action::SetSelection { max_ping_ms: Some(80) }).await.unwrap();
+    let changed = loop {
+        if let Some(view) = next(&mut watcher).await.view {
+            break view;
+        }
+    };
+    assert_eq!(changed.selection, Selection::MaxPing(Duration::from_millis(80)));
+
+    // New log lines arrive on their own, each once.
+    writeln!(logs.make_writer(), "a new line").unwrap();
+    let mut received = Vec::new();
+    while !received.iter().any(|l: &String| l == "a new line") {
+        received.extend(next(&mut watcher).await.logs);
+    }
+    assert_eq!(received.iter().filter(|l| *l == "a new line").count(), 1);
+    assert!(!received.iter().any(|l| l == "before watching"), "old lines aren't sent again");
+
+    // A watcher that goes away doesn't disturb the service.
+    drop(watcher);
+    assert!(client.view().await.is_ok());
+
+    stop.send(()).unwrap();
+    service.await.unwrap();
+}
+
+async fn next(watcher: &mut dvpn::control::Watcher) -> dvpn::control::Update {
+    tokio::time::timeout(std::time::Duration::from_secs(5), watcher.next()).await.expect("no update").unwrap()
 }

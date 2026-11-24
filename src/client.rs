@@ -1,6 +1,8 @@
 //! `dvpn connect`: builds a circuit, brings up the TUN device and routes, forwards
 //! packets, and rebuilds the circuit when it fails. Routes stay in place while
-//! reconnecting, so traffic is blocked rather than leaked (kill switch).
+//! reconnecting. The caller holds a [`crate::platform::tunnel::KillSwitch`] from before this
+//! starts until the user disconnects, so traffic is blocked rather than leaked while
+//! connecting, reconnecting, and if this fails.
 //!
 //! Using the network requires lending to it (docs/DESIGN.md §3.9): no circuit is built
 //! until our own exit is usable by others, and the circuit is closed (traffic blocked)
@@ -19,13 +21,14 @@ use tracing::{info, warn};
 
 use crate::addrs::{self, is_circuit};
 use crate::circuit::{CircuitError, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, Tunnel};
-use crate::control::{CircuitReport, Phase, SharedState};
+use crate::control::{CircuitReport, Phase, SharedState, Traffic};
 use crate::device::{PacketDevice, TunDevice};
 use crate::lend::LendingHandle;
 use crate::node::{Circuit, NodeHandle};
 use crate::packet;
 use crate::records::{ExitKind, ExitRecord, now_secs};
-use crate::routes::RouteGuard;
+use crate::dns::DnsOverTls;
+use crate::platform::tunnel::RouteGuard;
 use crate::select::{self, Prepare};
 
 const PEER_WAIT: Duration = Duration::from_secs(30);
@@ -45,6 +48,7 @@ pub struct ConnectOptions {
     pub tun_name: String,
     /// DNS server to use through the tunnel (via systemd-resolved); `None` leaves DNS alone.
     pub dns: Option<Ipv4Addr>,
+    pub dns_over_tls: DnsOverTls,
 }
 
 /// Candidates kept for reconnecting while the tunnel (and with it the DHT) is down.
@@ -76,10 +80,11 @@ enum Interruption {
     CircuitLost(anyhow::Error),
     LendingDown,
     /// We were on another user's exit and a dedicated one is now up (make-before-break).
-    DedicatedExitUp(Circuit),
+    DedicatedExitUp(Box<Circuit>),
 }
 
-/// Runs until the device fails or the future is dropped (which restores routing).
+/// Runs until the device fails or the future is dropped (which restores routing; the
+/// caller's kill switch keeps blocking).
 /// `state.lending` must be set: connecting without lending is refused.
 pub async fn run(handle: NodeHandle, options: ConnectOptions, state: SharedState) -> anyhow::Result<()> {
     let lending = state.lending.clone().context("connecting requires lending, but no exit is running")?;
@@ -95,7 +100,7 @@ pub async fn run(handle: NodeHandle, options: ConnectOptions, state: SharedState
         .with_context(|| format!("creating TUN device {}", options.tun_name))?;
 
     // Locked only briefly and never across an await: test circuits exempt relays in parallel.
-    let routes = RouteGuard::install(&options.tun_name, options.dns)?;
+    let routes = RouteGuard::install(&options.tun_name, options.dns, options.dns_over_tls)?;
     *state.warnings.lock().expect("state lock") = routes.warnings.clone();
     let routes = Mutex::new(routes);
     // Declared after `routes`, so it drops (reporting "unprotected") before they go.
@@ -112,16 +117,18 @@ pub async fn run(handle: NodeHandle, options: ConnectOptions, state: SharedState
     // Keep candidates fresh; while connected, these lookups go through the tunnel.
     let refresher = tokio::spawn(refresh(handle.clone(), candidates.clone()));
     let result = loop {
-        let kind = exit_kind(&candidates, circuit.exit);
-        publish(&state, Some((&circuit, kind)));
+        let info = exit_info(&candidates, circuit.exit);
+        let kind = info.kind;
+        publish(&state, Some((&circuit, &info)));
         state.set_phase(Phase::Connected);
         state.set_error(None);
-        info!(relay = %circuit.relay, exit = %circuit.exit, ?kind, "tunnel up");
+        info!(?kind, "tunnel up");
+        tracing::debug!(relay = %circuit.relay, exit = %circuit.exit, "circuit");
         let interruption = tokio::select! {
-            error = pump(&device, &mut circuit.tunnel) => Interruption::CircuitLost(error),
+            error = pump_counting(&device, &mut circuit.tunnel, &state.traffic) => Interruption::CircuitLost(error),
             () = lending_lost(&handle, &lending) => Interruption::LendingDown,
             new = dedicated_exit_up(&handle, &routes, &lending, &state), if kind == ExitKind::User => {
-                Interruption::DedicatedExitUp(new)
+                Interruption::DedicatedExitUp(Box::new(new))
             }
         };
         publish(&state, None);
@@ -141,7 +148,7 @@ pub async fn run(handle: NodeHandle, options: ConnectOptions, state: SharedState
             }
             Interruption::DedicatedExitUp(new) => {
                 info!("a dedicated exit is available; leaving the exit lent by another user");
-                Some(new)
+                Some(*new)
             }
         };
 
@@ -225,7 +232,7 @@ async fn wait_for_peers(handle: &NodeHandle) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + PEER_WAIT;
     while handle.routing_peers().await?.is_empty() {
         if tokio::time::Instant::now() > deadline {
-            bail!("could not reach any peers; pass --bootstrap <multiaddr>");
+            bail!("could not reach any other peer; add an invite link or a bootstrap peer from someone already in the network");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -363,10 +370,29 @@ async fn dedicated_exit_up(
     }
 }
 
-fn exit_kind(candidates: &Mutex<Candidates>, exit: PeerId) -> ExitKind {
+/// What the client knows about an exit from its record.
+struct ExitInfo {
+    kind: ExitKind,
+    /// Where the exit's traffic appears to come from.
+    public_ip: Option<Ipv4Addr>,
+}
+
+fn exit_info(candidates: &Mutex<Candidates>, exit: PeerId) -> ExitInfo {
     let candidates = candidates.lock().expect("candidates lock");
-    // An exit we have no record for can't be told apart; treat it as dedicated.
-    candidates.exits.iter().find(|e| e.peer_id == exit).map_or(ExitKind::Dedicated, |e| e.kind)
+    let record = candidates.exits.iter().find(|e| e.peer_id == exit);
+    ExitInfo {
+        // An exit we have no record for can't be told apart; treat it as dedicated.
+        kind: record.map_or(ExitKind::Dedicated, |e| e.kind),
+        public_ip: record.and_then(|e| public_ipv4(&e.addrs)),
+    }
+}
+
+/// The first public IPv4 address that isn't a relay's (in a relay circuit address).
+fn public_ipv4(addrs: &[Multiaddr]) -> Option<Ipv4Addr> {
+    addrs.iter().filter(|a| !addrs::is_circuit(a)).find_map(|a| match addrs::ip_of(a) {
+        Some(std::net::IpAddr::V4(ip)) if addrs::is_public_v4(ip) => Some(ip),
+        _ => None,
+    })
 }
 
 /// One attempt at a circuit under the current selection mode, publishing the probe
@@ -404,13 +430,20 @@ fn direct_ipv4s(addrs: &[Multiaddr]) -> Vec<Ipv4Addr> {
     ips
 }
 
-fn publish(state: &SharedState, circuit: Option<(&Circuit, ExitKind)>) {
-    *state.circuit.lock().expect("state lock") = circuit.map(|(c, kind)| CircuitReport {
+fn publish(state: &SharedState, circuit: Option<(&Circuit, &ExitInfo)>) {
+    state.traffic.new_circuit();
+    *state.datagrams.lock().expect("state lock") = circuit.and_then(|(c, _)| c.tunnel.datagram_liveness());
+    *state.circuit.lock().expect("state lock") = circuit.map(|(c, info)| CircuitReport {
         relay: c.relay.to_string(),
         exit: c.exit.to_string(),
-        exit_is_user: kind == ExitKind::User,
+        exit_is_user: info.kind == ExitKind::User,
         assigned_ip: c.tunnel.assigned_ip.to_string(),
         connected_since: now_secs(),
+        datagrams: false,
+        exit_ip: info.public_ip.map(|ip| ip.to_string()),
+        rtt_ms: None,
+        bytes_sent: 0,
+        bytes_received: 0,
     });
 }
 
@@ -423,11 +456,22 @@ fn keepalive_check_delay() -> Duration {
 /// Moves packets between the TUN device and the tunnel until either side fails or the
 /// exit has been silent for [`KEEPALIVE_TIMEOUT`] (it may vanish without closing anything).
 pub async fn pump<D: PacketDevice>(device: &D, tunnel: &mut Tunnel) -> anyhow::Error {
+    pump_counting(device, tunnel, &Traffic::default()).await
+}
+
+/// Like [`pump`], counting the traffic in `traffic` and timing keepalives (the exit
+/// answers each) for the circuit's latency.
+pub async fn pump_counting<D: PacketDevice>(device: &D, tunnel: &mut Tunnel, traffic: &Traffic) -> anyhow::Error {
     let assigned = tunnel.assigned_ip;
     let Tunnel { tx, rx, .. } = tunnel;
     let last_received = Mutex::new(Instant::now());
+    // When the keepalive whose answer we wait for was sent.
+    let probe = Mutex::new(None::<Instant>);
     let outbound = async {
         let mut buf = vec![0u8; 65536];
+        // One right away, so the latency is known from the start.
+        tx.send(&[]).await?;
+        *probe.lock().expect("pump lock") = Some(Instant::now());
         let mut last_sent = Instant::now();
         let check = tokio::time::sleep(keepalive_check_delay());
         tokio::pin!(check);
@@ -445,16 +489,20 @@ pub async fn pump<D: PacketDevice>(device: &D, tunnel: &mut Tunnel) -> anyhow::E
                 if silent >= KEEPALIVE_INTERVAL || last_sent.elapsed() >= KEEPALIVE_INTERVAL {
                     tx.send(&[]).await?;
                     last_sent = Instant::now();
+                    probe.lock().expect("pump lock").get_or_insert(last_sent);
                 }
                 continue;
             };
             let packet = &buf[..n];
             // Only our own IPv4 traffic enters the tunnel (the exit would drop the rest).
-            if !packet::parse(packet).is_some_and(|p| p.src == assigned) {
+            if packet::parse(packet).is_none_or(|p| p.src != assigned) {
                 continue;
             }
             match tx.send(packet).await {
-                Ok(()) => last_sent = Instant::now(),
+                Ok(()) => {
+                    last_sent = Instant::now();
+                    traffic.sent.fetch_add(n as u64, Ordering::Relaxed);
+                }
                 Err(CircuitError::PacketTooLarge) => {}
                 Err(e) => return Err::<Infallible, anyhow::Error>(e.into()),
             }
@@ -466,8 +514,14 @@ pub async fn pump<D: PacketDevice>(device: &D, tunnel: &mut Tunnel) -> anyhow::E
             // Anything from the exit counts, including its keepalive answers.
             *last_received.lock().expect("pump lock") = Instant::now();
             match received {
+                Some(packet) if packet.is_empty() => {
+                    if let Some(sent) = probe.lock().expect("pump lock").take() {
+                        traffic.add_rtt(sent.elapsed());
+                    }
+                }
                 Some(packet) if packet::parse(&packet).is_some_and(|p| p.dst == assigned) => {
                     device.send(&packet).await?;
+                    traffic.received.fetch_add(packet.len() as u64, Ordering::Relaxed);
                 }
                 Some(_) => {}
                 None => return Err::<Infallible, anyhow::Error>(anyhow::anyhow!("exit closed the tunnel")),
@@ -477,5 +531,22 @@ pub async fn pump<D: PacketDevice>(device: &D, tunnel: &mut Tunnel) -> anyhow::E
     tokio::select! {
         Err(e) = outbound => e,
         Err(e) = inbound => e,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_exit_ip_shown_is_its_own_public_one() {
+        let addrs = |list: &[&str]| list.iter().map(|a| a.parse::<Multiaddr>().unwrap()).collect::<Vec<_>>();
+        let relayed = "/ip4/8.8.8.8/tcp/4001/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA/p2p-circuit";
+        assert_eq!(public_ipv4(&addrs(&[relayed])), None, "a relay's IP isn't where traffic leaves");
+        assert_eq!(public_ipv4(&addrs(&["/ip4/192.168.1.4/tcp/4001", relayed])), None, "nor a private one");
+        assert_eq!(
+            public_ipv4(&addrs(&["/ip4/192.168.1.4/tcp/4001", relayed, "/ip4/8.8.4.4/udp/4001/quic-v1"])),
+            Some(Ipv4Addr::new(8, 8, 4, 4))
+        );
     }
 }

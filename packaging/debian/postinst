@@ -2,11 +2,14 @@
 set -e
 
 if [ "$1" = "configure" ]; then
-    # The group whose members control the service (packaging/dvpn.sysusers).
+    # The service's user, and its group whose members control the service
+    # (packaging/dvpn.sysusers).
     if command -v systemd-sysusers >/dev/null 2>&1; then
         systemd-sysusers dvpn.conf
-    elif ! getent group dvpn >/dev/null; then
-        groupadd --system dvpn
+    elif ! getent passwd dvpn >/dev/null; then
+        getent group dvpn >/dev/null || groupadd --system dvpn
+        useradd --system --gid dvpn --home-dir /var/lib/dvpn --no-create-home \
+            --shell /usr/sbin/nologin --comment "dvpn VPN service" dvpn
     fi
 
     # Whoever installed the package (via sudo, or pkexec from a software centre)
@@ -18,11 +21,11 @@ if [ "$1" = "configure" ]; then
     if [ -n "$installer" ] && [ "$installer" != "root" ] && id "$installer" >/dev/null 2>&1; then
         if ! id -nG "$installer" | tr ' ' '\n' | grep -qx dvpn; then
             usermod -aG dvpn "$installer"
-            echo "dvpn: added $installer to the dvpn group. Log out and back in, then open the dvpn app."
+            echo "dvpn: added $installer to the dvpn group."
         fi
-    else
-        echo "dvpn: to control the VPN without sudo, add yourself to the dvpn group: sudo usermod -aG dvpn \$USER"
     fi
+    # Nothing else to set up: whoever is signed in at this computer can use the dvpn app
+    # (polkit), and group membership applies at once, without logging out.
 fi
 
 #DEBHELPER#

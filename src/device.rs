@@ -30,6 +30,43 @@ impl TunDevice {
         Ok(Self(device))
     }
 
+    /// Like [`Self::create`], with `queues` queues (Linux multi-queue TUN): the kernel
+    /// spreads received packets over them by flow, so several tasks can read at once.
+    /// Falls back to one queue where multi-queue isn't available.
+    pub fn create_queues(name: &str, addr: Ipv4Addr, prefix: u8, mtu: u16, queues: usize) -> io::Result<Vec<Self>> {
+        if queues <= 1 {
+            return Ok(vec![Self::create(name, addr, prefix, mtu)?]);
+        }
+        let first = tun_rs::DeviceBuilder::new()
+            .name(name)
+            .ipv4(addr, prefix, None)
+            .mtu(mtu)
+            .with(|builder| {
+                builder.multi_queue(true);
+            })
+            .build_async();
+        let first = match first {
+            Ok(device) => device,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Self::create(name, addr, prefix, mtu).map(|d| vec![d]),
+            Err(e) => {
+                tracing::warn!("no multi-queue TUN ({e}); using one queue");
+                return Ok(vec![Self::create(name, addr, prefix, mtu)?]);
+            }
+        };
+        let mut devices = Vec::with_capacity(queues);
+        for _ in 1..queues {
+            match first.try_clone() {
+                Ok(queue) => devices.push(Self(queue)),
+                Err(e) => {
+                    tracing::warn!("could not add a TUN queue ({e}); using {}", devices.len() + 1);
+                    break;
+                }
+            }
+        }
+        devices.insert(0, Self(first));
+        Ok(devices)
+    }
+
     /// Swaps the device's IPv4 address without ever leaving it with none: Linux deletes
     /// every route through a device that loses its last IPv4 address, which would
     /// silently remove the client's kill-switch routes.

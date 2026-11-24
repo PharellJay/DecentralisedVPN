@@ -36,6 +36,8 @@
     <h1>Using dvpn means lending your connection</h1>
     <p class="lead">Other users' traffic will leave the internet through your connection, while yours leaves through theirs.</p>
     <div class="terms" id="terms"></div>
+    <label class="check"><input type="checkbox" id="consent-boot" checked> Also lend when this computer starts, even when I'm not connected</label>
+    <p class="hint">You can change this later in the Lending section.</p>
     <div class="row">
       <button class="primary" id="accept">Accept and continue</button>
     </div>
@@ -51,16 +53,18 @@
       <button class="primary big" id="toggle">Connect</button>
     </section>
 
-    <div class="banner warn" id="unprotected" hidden>Not protected yet: your traffic goes out normally until the first connection is up.</div>
+    <div class="banner warn" id="unprotected" hidden>Not fully protected: dvpn couldn't install its firewall, so traffic may go out normally while not connected.</div>
     <div id="warnings"></div>
     <div class="banner error" id="error" hidden></div>
 
     <section class="card" id="circuit-card" hidden>
       <h2>Connection</h2>
       <dl>
-        <dt>Tunnel IP</dt><dd id="c-ip"></dd>
+        <dt>Your IP</dt><dd id="c-ip"></dd>
         <dt>Exit</dt><dd id="c-exit"></dd>
-        <dt>Relay</dt><dd id="c-relay"></dd>
+        <dt>Latency</dt><dd id="c-rtt"></dd>
+        <dt>Data</dt><dd id="c-data"></dd>
+        <dt>Transport</dt><dd id="c-transport"></dd>
         <dt>Up for</dt><dd id="c-up"></dd>
       </dl>
     </section>
@@ -100,13 +104,22 @@
     </section>
 
     <details class="card" id="network-card">
-      <summary><h2>Bootstrap peer</h2></summary>
-      <p class="hint">The first time, dvpn needs the address of one peer it can reach, ending in <code>/p2p/&lt;peer-id&gt;</code>. After that it remembers the peers it found.</p>
+      <summary><h2>Bootstrap peers</h2></summary>
+      <p class="hint">The first time, dvpn needs one peer it can reach: an invite link from someone who already uses dvpn, or a peer address ending in <code>/p2p/&lt;peer-id&gt;</code> from whoever runs a server for your group. After that it remembers the peers it found.</p>
+      <ul class="peers" id="bootstrap-list"></ul>
       <form class="row" id="bootstrap-form">
-        <input type="text" id="bootstrap" placeholder="/ip4/203.0.113.7/tcp/4001/p2p/12D3KooW…" spellcheck="false" autocomplete="off">
+        <input type="text" id="bootstrap" placeholder="dvpn://join?… or /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW…" spellcheck="false" autocomplete="off">
         <button class="secondary" type="submit">Add</button>
       </form>
       <p class="hint" id="bootstrap-result"></p>
+      <div id="invite-box" hidden>
+        <h3>Invite someone</h3>
+        <p class="hint">Send this link to someone you want to bring in. It holds the servers you use (not your own address), so it keeps working after dvpn restarts.</p>
+        <div class="row">
+          <input type="text" id="invite" readonly spellcheck="false">
+          <button class="secondary" id="copy-invite" type="button">Copy</button>
+        </div>
+      </div>
     </details>
 
     <details class="card">

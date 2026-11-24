@@ -2,7 +2,13 @@
 //!
 //! An exit publishes an [`ExitRecord`] wrapped in a libp2p `SignedEnvelope`, signed
 //! with its node key, under `/dvpn/exit-record/v1/<peer-id>`. Exits and relays also
-//! announce themselves as providers of [`EXIT_PROVIDER_KEY`] / [`RELAY_PROVIDER_KEY`].
+//! announce themselves as providers of [`exit_provider_key`] / [`relay_provider_key`].
+//!
+//! Those provider keys are split into [`PROVIDER_SHARDS`] shards, each node announcing
+//! itself in the one its peer ID falls into, and lookups ask all shards. A DHT node
+//! keeps only a limited number of providers per key and ignores newcomers once full,
+//! so with a single key whoever got there first (e.g. an attacker's few dozen nodes)
+//! would be all that anyone could find, and the network couldn't grow past that.
 //!
 //! Every node validates records before storing them, so nobody can overwrite another
 //! exit's record, replay a stale one, or use the DHT as general-purpose storage.
@@ -15,8 +21,12 @@ use libp2p::kad::{ProviderRecord, Record, RecordKey};
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 
-pub const EXIT_PROVIDER_KEY: &[u8] = b"/dvpn/exit/v1";
-pub const RELAY_PROVIDER_KEY: &[u8] = b"/dvpn/relay/v1";
+const EXIT_PROVIDER_PREFIX: &str = "/dvpn/exit/v2/";
+const RELAY_PROVIDER_PREFIX: &str = "/dvpn/relay/v2/";
+/// Provider-key shards; see the module docs.
+pub const PROVIDER_SHARDS: u8 = 8;
+/// Providers a DHT node keeps per key (libp2p's default is 20).
+pub const MAX_PROVIDERS_PER_KEY: usize = 64;
 const EXIT_RECORD_PREFIX: &str = "/dvpn/exit-record/v1/";
 const DOMAIN: &str = "dvpn-exit-record";
 const PAYLOAD_TYPE: &[u8] = b"/dvpn/exit-record/2";
@@ -87,10 +97,25 @@ pub fn exit_record_key(peer: &PeerId) -> RecordKey {
     RecordKey::new(&format!("{EXIT_RECORD_PREFIX}{peer}"))
 }
 
-/// Only our own provider namespaces are stored for other peers.
+/// The shard a peer announces itself in.
+pub fn shard_of(peer: &PeerId) -> u8 {
+    // The last byte of an Ed25519 peer ID is part of the public key: uniform.
+    peer.to_bytes().last().copied().unwrap_or(0) % PROVIDER_SHARDS
+}
+
+pub fn exit_provider_key(shard: u8) -> RecordKey {
+    RecordKey::new(&format!("{EXIT_PROVIDER_PREFIX}{shard}"))
+}
+
+pub fn relay_provider_key(shard: u8) -> RecordKey {
+    RecordKey::new(&format!("{RELAY_PROVIDER_PREFIX}{shard}"))
+}
+
+/// Only our own provider namespaces are stored for other peers, and only in the shard
+/// the provider belongs to (so nobody can crowd every shard with the same nodes).
 pub fn is_known_provider_key(record: &ProviderRecord) -> bool {
-    let key = record.key.as_ref();
-    key == EXIT_PROVIDER_KEY || key == RELAY_PROVIDER_KEY
+    let shard = shard_of(&record.provider);
+    record.key == exit_provider_key(shard) || record.key == relay_provider_key(shard)
 }
 
 impl ExitRecord {
@@ -175,6 +200,21 @@ mod tests {
             kind: ExitKind::Dedicated,
             expires_at,
         }
+    }
+
+    #[test]
+    fn providers_are_stored_only_in_their_own_shard() {
+        let peer = PeerId::random();
+        let own = shard_of(&peer);
+        let other = (own + 1) % PROVIDER_SHARDS;
+        let record = |key| ProviderRecord::new(key, peer, vec![]);
+        assert!(is_known_provider_key(&record(exit_provider_key(own))));
+        assert!(is_known_provider_key(&record(relay_provider_key(own))));
+        assert!(!is_known_provider_key(&record(exit_provider_key(other))), "crowding another shard");
+        assert!(!is_known_provider_key(&record(RecordKey::new(&"/something/else"))));
+        // Shards are spread out.
+        let shards: std::collections::HashSet<u8> = (0..200).map(|_| shard_of(&PeerId::random())).collect();
+        assert_eq!(shards.len(), PROVIDER_SHARDS as usize);
     }
 
     #[test]

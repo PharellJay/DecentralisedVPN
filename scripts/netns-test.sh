@@ -21,7 +21,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$(realpath "${1:-$ROOT/target/debug/dvpn}")"
 WORK="$(mktemp -d /tmp/dvpn-netns.XXXXXX)"
 NAMESPACES=(dvt-core dvt-relay dvt-relay2 dvt-exit dvt-web dvt-home dvt-client dvt-home2 dvt-client2 dvt-nat1 dvt-exit2)
-COMMON=(--no-mdns --allow-private-addrs)
+COMMON=(--allow-private-addrs)
 declare -A PID
 PASS=0
 FAIL=0
@@ -82,6 +82,7 @@ serve() { # <ns> <addr> <port> <log>
 }
 serve dvt-web 203.0.113.80 80 web.log
 serve dvt-web 203.0.113.80 25 smtp.log
+serve dvt-web 203.0.113.80 6881 torrent.log  # not on users' exits' port list
 serve dvt-exit 192.168.50.1 8080 exit-lan.log
 serve dvt-exit 198.51.100.20 8081 exit-host.log
 
@@ -116,7 +117,7 @@ WEB=http://203.0.113.80
 RELAY=$(init dvt-relay relay)
 BOOT=/ip4/198.51.100.10/tcp/4001/p2p/$RELAY
 init dvt-exit exit > /dev/null
-CLIENT=$(init dvt-client client)
+init dvt-client client > /dev/null  # users' nodes get a new identity every session
 CLIENT_ARGS=(connect "${COMMON[@]}" --bootstrap "$BOOT" --dns none --accept-exit-risk)
 
 # ---------------------------------------------------------------- scenario A: public exit
@@ -132,6 +133,9 @@ check "client builds a circuit" wait_until 90 circuit_up
 check "all IPv4 is routed into dvpn0" bash -c "ip netns exec dvt-client ip route | grep -q '^0.0.0.0/1 dev dvpn0'"
 check "IPv6 is blackholed" bash -c "ip netns exec dvt-client ip -6 route | grep -q 'blackhole ::/1'"
 check "web is reachable through the tunnel" http_ok dvt-client $WEB/c1
+uses_datagrams() { status dvt-client client | grep -q '"datagrams": true'; }
+check "packets go as UDP datagrams through the relay" wait_until 30 uses_datagrams
+check "web works over datagrams" http_ok dvt-client $WEB/c1
 check "web server sees the exit's IP" web_saw 198.51.100.20 /c1
 check "web server never sees the client's IP" not web_saw 198.51.100.30
 check "(sanity) exit LAN service is up" http_ok dvt-exit http://192.168.50.1:8080/
@@ -140,12 +144,23 @@ check "(sanity) exit host service is up" http_ok dvt-relay http://198.51.100.20:
 check "exit host's own services are unreachable" not http_ok dvt-client http://198.51.100.20:8081/
 check "(sanity) port 25 is reachable without the tunnel" http_ok dvt-relay http://203.0.113.80:25/
 check "SMTP (TCP 25) is blocked by the exit" not http_ok dvt-client http://203.0.113.80:25/
+check "a dedicated exit forwards uncommon ports" http_ok dvt-client http://203.0.113.80:6881/
 serve dvt-client 0.0.0.0 8082 client-service.log
 check "(sanity) a service on the client is up, and the tunnel IP is known" bash -c \
     "[[ \"\$(ip netns exec dvt-client curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8082/)\" == 200 ]] \
      && ip netns exec dvt-client '$BIN' --data-dir '$WORK/client' status | grep -q '\"assigned_ip\": \"10.77'"
 check "the exit can't connect to services on the client through the tunnel" not exit_reaches_client_service
 check "exit reports one session" bash -c "ip netns exec dvt-exit '$BIN' --data-dir '$WORK/exit' status | grep -q '\"exit_sessions\": 1'"
+
+echo "== UDP blocked at the relay"
+nsx dvt-relay nft add table inet dvt-udp-block
+nsx dvt-relay nft add chain inet dvt-udp-block input '{ type filter hook input priority -10; }'
+nsx dvt-relay nft add rule inet dvt-udp-block input udp dport 4002 drop
+check "packets fall back to the circuit's stream" wait_until 40 not uses_datagrams
+check "the circuit survives the switch" circuit_up
+check "web works over the stream" wait_until 10 http_ok dvt-client $WEB/c1
+nsx dvt-relay nft delete table inet dvt-udp-block
+check "packets go as datagrams again once UDP gets through" wait_until 30 uses_datagrams
 
 echo "== kill switch"
 stop exit KILL
@@ -213,6 +228,7 @@ check "teardown script cleans up after a killed exit, restoring ip_forward" bash
 # while it keeps lending. Its kill-switch routes are in place the whole time.
 check "client1 is blocked while no other exit exists" wait_until 60 not http_ok dvt-client $WEB/c1
 check "client1 keeps lending while its own VPN is blocked" lending dvt-client client
+CLIENT=$(status dvt-client client | grep -o '"peer_id": "[^"]*"' | cut -d'"' -f4)
 start dvt-client2 client2 connect "${COMMON[@]}" --bootstrap "$BOOT" --dns none --accept-exit-risk --max-ping 2000
 uses() { status "$1" "$2" | grep -q "\"exit\": \"$3\""; } # <ns> <name> <exit-peer-id>
 check "client2 falls back to client1's exit (no dedicated exit is up)" wait_until 150 uses dvt-client2 client2 "$CLIENT"
@@ -222,6 +238,7 @@ check "client2 reports its ping measurement" bash -c \
     "ip netns exec dvt-client2 '$BIN' --data-dir '$WORK/client2' status | grep -q '\"within_limit\": [1-9]'"
 check "client2 reaches the web through client1" wait_until 20 http_ok dvt-client2 $WEB/c2
 check "web server sees client2's traffic from client1's IP" web_saw 198.51.100.30 /c2
+check "another user's exit refuses ports outside its list" not http_ok dvt-client2 http://203.0.113.80:6881/
 
 start dvt-exit2 exit2 "${EXIT2_ARGS[@]}"
 check "client1 picks the dedicated exit2, not client2's exit" wait_until 150 uses dvt-client client "$EXIT2"

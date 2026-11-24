@@ -2,11 +2,13 @@
 //! NAT traversal (AutoNAT, Circuit Relay v2, DCUtR), signed-record publication, and
 //! the splice/exit stream protocols.
 //!
-//! Logging never includes remote peer addresses; only peer IDs at debug level.
+//! Logging never includes remote peer addresses, and remote peer IDs only at debug level.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
@@ -27,14 +29,18 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::addrs;
+use crate::datagram;
 use crate::circuit::{self, CircuitError, EXIT_PROTOCOL, ExitSession, IpPool, SPLICE_PROTOCOL, Tunnel};
 use crate::config::split_peer_addr;
 use crate::guard;
-use crate::identity::Identity;
+use crate::identity::{ExitKeys, Identity};
 use crate::peer_cache;
-use crate::records::{self, EXIT_PROVIDER_KEY, ExitKind, ExitRecord, RECORD_LIFETIME, RELAY_PROVIDER_KEY};
+use crate::records::{self, ExitKind, ExitRecord, PROVIDER_SHARDS, RECORD_LIFETIME};
 
-pub const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/dvpn/kad/1.0.0");
+/// Version 2: sharded provider keys and larger responses; not compatible with version 1.
+pub const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/dvpn/kad/2.0.0");
+/// Room for [`records::MAX_PROVIDERS_PER_KEY`] providers with their addresses.
+const KAD_MAX_PACKET: usize = 64 * 1024;
 const IDENTIFY_PROTOCOL: &str = "/dvpn/id/1.0.0";
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -45,6 +51,28 @@ const MAX_RELAY_RESERVATIONS: usize = 2;
 const MAX_EXIT_LOOKUPS: usize = 16;
 const MAX_CIRCUIT_ATTEMPTS: usize = 3;
 const RELAY_RETRY_AFTER: Duration = Duration::from_secs(30);
+const MAX_OBSERVED_ADDRS: usize = 8;
+/// Distinct peers that must report the same public address before it counts as ours.
+const CONFIRMING_PEERS: usize = 2;
+const MAX_PENDING_INCOMING: u32 = 64;
+const MAX_ESTABLISHED_INCOMING: u32 = 512;
+/// A few, for simultaneous dials, hole punching and relayed plus direct connections.
+const MAX_CONNECTIONS_PER_PEER: u32 = 8;
+/// After a failed publication of our exit record, how long until we try again.
+const PUBLISH_RETRY: Duration = Duration::from_secs(30);
+
+/// An exit-record publication in flight: it counts as published only once the record
+/// was stored and the provider entry announced.
+struct PendingPublish {
+    put: kad::QueryId,
+    provide: kad::QueryId,
+    put_ok: Option<bool>,
+    provide_ok: Option<bool>,
+    at: Instant,
+    addrs: Vec<Multiaddr>,
+    /// The Noise key in the record.
+    key: [u8; 32],
+}
 
 /// How the node decides whether it is reachable from the internet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +124,9 @@ pub struct NodeConfig {
     pub exit: Option<ExitConfig>,
     /// Treat loopback/private addresses as usable (local testing, LAN-only networks).
     pub allow_private_addrs: bool,
+    /// UDP port for circuits' datagram path ([`crate::datagram`]; 0: any free port);
+    /// `None` carries packets over streams only.
+    pub datagram_port: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -117,6 +148,42 @@ pub struct NodeStatus {
     pub publicly_reachable: bool,
     /// Our exit record was published and is still valid.
     pub exit_published: bool,
+    /// Public IPv4 addresses peers recently saw us at (behind NAT: the router's).
+    pub observed_addrs: Vec<Ipv4Addr>,
+    /// The public address most recently reported by at least two distinct peers.
+    pub confirmed_public_ip: Option<Ipv4Addr>,
+}
+
+/// Public addresses peers reported seeing us at (identify's observed address).
+#[derive(Default)]
+struct ObservedAddrs {
+    /// Oldest first, each with (up to [`CONFIRMING_PEERS`] of) the peers that reported it.
+    recent: VecDeque<(Ipv4Addr, HashSet<PeerId>)>,
+    /// The address that most recently reached [`CONFIRMING_PEERS`] reporters.
+    confirmed: Option<Ipv4Addr>,
+}
+
+impl ObservedAddrs {
+    fn record(&mut self, ip: Ipv4Addr, reporter: PeerId) {
+        let index = match self.recent.iter().position(|(known, _)| *known == ip) {
+            Some(index) => index,
+            None => {
+                if self.recent.len() >= MAX_OBSERVED_ADDRS {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back((ip, HashSet::new()));
+                self.recent.len() - 1
+            }
+        };
+        let reporters = &mut self.recent[index].1;
+        if reporters.len() < CONFIRMING_PEERS && reporters.insert(reporter) && reporters.len() == CONFIRMING_PEERS {
+            self.confirmed = Some(ip);
+        }
+    }
+
+    fn addrs(&self) -> Vec<Ipv4Addr> {
+        self.recent.iter().map(|(ip, _)| *ip).collect()
+    }
 }
 
 /// An open client circuit.
@@ -137,6 +204,8 @@ pub struct Node {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    /// Caps connections, so nobody can exhaust the node by opening thousands.
+    limits: libp2p::connection_limits::Behaviour,
     kad: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
@@ -164,6 +233,8 @@ enum Command {
     },
     GetProviders(kad::RecordKey, Reply<HashSet<PeerId>>),
     GetRecords(kad::RecordKey, Reply<Vec<kad::Record>>),
+    AddPeer(PeerId, Multiaddr, Reply<()>),
+    RelayAddrs(Reply<Vec<Multiaddr>>),
     Shutdown(Reply<()>),
 }
 
@@ -174,11 +245,21 @@ pub struct NodeHandle {
     tx: mpsc::Sender<Command>,
     control: libp2p_stream::Control,
     data_dir: PathBuf,
+    datagrams: Option<Arc<datagram::Socket>>,
 }
 
 impl NodeHandle {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    pub(crate) fn datagram_socket(&self) -> Option<Arc<datagram::Socket>> {
+        self.datagrams.clone()
+    }
+
+    /// The UDP port of the datagram path, if it's enabled.
+    pub fn datagram_port(&self) -> Option<u16> {
+        self.datagrams.as_ref().map(|s| s.port())
     }
 
     pub(crate) fn control(&self) -> libp2p_stream::Control {
@@ -213,7 +294,7 @@ impl NodeHandle {
 
     /// Valid, unexpired exit records found in the DHT.
     pub async fn find_exits(&self) -> anyhow::Result<Vec<ExitRecord>> {
-        let providers = self.providers(EXIT_PROVIDER_KEY).await?;
+        let providers = self.providers(records::exit_provider_key).await?;
         let lookups = providers
             .into_iter()
             .filter(|p| *p != self.peer_id)
@@ -231,7 +312,7 @@ impl NodeHandle {
 
     /// Peers announcing themselves as entry relays.
     pub async fn find_relays(&self) -> anyhow::Result<Vec<PeerId>> {
-        let relays = self.providers(RELAY_PROVIDER_KEY).await?;
+        let relays = self.providers(records::relay_provider_key).await?;
         Ok(relays.into_iter().filter(|p| *p != self.peer_id).collect())
     }
 
@@ -245,7 +326,26 @@ impl NodeHandle {
 
     /// Like [`Self::open_circuit`] with known candidates. `prepare` runs before each
     /// attempt with the chosen relay and its known addresses (e.g. to add a route).
+    /// The relay used becomes the guard if there is none yet.
     pub async fn open_circuit_from(
+        &self,
+        exits: Vec<ExitRecord>,
+        relays: Vec<PeerId>,
+        prepare: impl FnMut(PeerId, &[Multiaddr]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Circuit> {
+        let circuit = self.build_circuit(exits, relays, prepare).await?;
+        self.remember_guard(circuit.relay);
+        Ok(circuit)
+    }
+
+    /// Like [`Self::open_circuit_from`], but never picks a new guard: for test circuits,
+    /// of which only one is kept (see [`Self::ensure_guard`]).
+    ///
+    /// The guard is tried first. If it can't be used (unreachable, no usable address),
+    /// the remaining attempts go through other relays, and after
+    /// [`guard::MAX_GUARD_FAILURES`] such failures in a row it is replaced: a relay
+    /// that went offline must not keep the client from connecting.
+    pub async fn build_circuit(
         &self,
         mut exits: Vec<ExitRecord>,
         mut relays: Vec<PeerId>,
@@ -257,32 +357,77 @@ impl NodeHandle {
         exits.shuffle(&mut rand::rng());
         relays.shuffle(&mut rand::rng());
         let saved_guard = guard::load(&self.data_dir);
+        let mut guard_failed = false;
 
         let mut last_error = anyhow!("no relay satisfies the path constraints");
         for exit in exits.iter().take(MAX_CIRCUIT_ATTEMPTS) {
-            let Some((relay, relay_addrs)) = self.choose_relay(saved_guard, &relays, exit).await? else {
+            let (first, avoid) = if guard_failed { (None, saved_guard) } else { (saved_guard, None) };
+            let Some((relay, relay_addrs)) = self.choose_relay(first, avoid, &relays, exit).await? else {
                 continue;
             };
+            let is_guard = saved_guard == Some(relay);
             if let Err(e) = prepare(relay, &relay_addrs) {
+                if is_guard {
+                    guard_failed = true;
+                    self.guard_failed();
+                }
                 last_error = e;
                 continue;
             }
             match self.open_circuit_via(relay, exit).await {
                 Ok(circuit) => {
-                    if saved_guard != Some(relay) {
-                        guard::save(&self.data_dir, relay)?;
+                    if is_guard {
+                        guard::record_success(&self.data_dir);
                     }
                     return Ok(circuit);
                 }
                 Err(e) => {
-                    if saved_guard == Some(relay) && matches!(e, CircuitError::RelayRefused) {
-                        guard::clear(&self.data_dir);
+                    if is_guard {
+                        match e {
+                            CircuitError::RelayRefused => {
+                                guard_failed = true;
+                                guard::clear(&self.data_dir);
+                            }
+                            CircuitError::RelayUnreachable(_) => {
+                                guard_failed = true;
+                                self.guard_failed();
+                            }
+                            // The exit's fault, not the guard's.
+                            _ => {}
+                        }
                     }
                     last_error = e.into();
                 }
             }
         }
         Err(last_error)
+    }
+
+    fn guard_failed(&self) {
+        if guard::record_failure(&self.data_dir) {
+            info!("the entry relay kept failing; choosing a new one");
+        }
+    }
+
+    /// Makes `relay` the guard if there is none (the first circuit, or the old guard
+    /// was replaced).
+    pub fn remember_guard(&self, relay: PeerId) {
+        if guard::load(&self.data_dir).is_none()
+            && let Err(e) = guard::save(&self.data_dir, relay)
+        {
+            warn!("could not save the entry relay: {e:#}");
+        }
+    }
+
+    /// Picks a guard now if there is none, before several test circuits are built at
+    /// once: they then all go through it, instead of each through a random relay.
+    pub fn ensure_guard(&self, relays: &[PeerId]) {
+        use rand::seq::IndexedRandom;
+        if guard::load(&self.data_dir).is_none()
+            && let Some(relay) = relays.choose(&mut rand::rng())
+        {
+            self.remember_guard(*relay);
+        }
     }
 
     /// Builds a circuit through a specific relay to a specific exit.
@@ -300,14 +445,29 @@ impl NodeHandle {
         self.request(Command::Shutdown).await
     }
 
+    /// Relays we're connected to, each with its direct address and `/p2p/<id>`: servers
+    /// with a stable identity, which others can join through.
+    pub async fn relay_addrs(&self) -> anyhow::Result<Vec<Multiaddr>> {
+        self.request(Command::RelayAddrs).await
+    }
+
+    /// Adds a bootstrap peer (`.../p2p/<id>`) to the running node: into the routing
+    /// table, dialled, and the DHT bootstrapped from it.
+    pub async fn add_peer(&self, addr: &Multiaddr) -> anyhow::Result<()> {
+        let (peer, transport) = split_peer_addr(addr)?;
+        self.request(|r| Command::AddPeer(peer, transport, r)).await
+    }
+
+    /// The first usable relay for `exit`, trying `first` before `relays`, never `avoid`.
     async fn choose_relay(
         &self,
-        saved_guard: Option<PeerId>,
+        first: Option<PeerId>,
+        avoid: Option<PeerId>,
         relays: &[PeerId],
         exit: &ExitRecord,
     ) -> anyhow::Result<Option<(PeerId, Vec<Multiaddr>)>> {
-        for candidate in saved_guard.iter().chain(relays) {
-            if *candidate == exit.peer_id || *candidate == self.peer_id {
+        for candidate in first.iter().chain(relays) {
+            if *candidate == exit.peer_id || *candidate == self.peer_id || Some(*candidate) == avoid {
                 continue;
             }
             let relay_addrs = self.peer_addrs(*candidate).await?;
@@ -328,8 +488,14 @@ impl NodeHandle {
         self.request(|r| Command::ConnectedAddrs(peer, r)).await
     }
 
-    async fn providers(&self, key: &[u8]) -> anyhow::Result<HashSet<PeerId>> {
-        self.request(|r| Command::GetProviders(kad::RecordKey::new(&key), r)).await
+    /// Providers of every shard of a provider key, looked up in parallel.
+    async fn providers(&self, key: fn(u8) -> kad::RecordKey) -> anyhow::Result<HashSet<PeerId>> {
+        let lookups = (0..PROVIDER_SHARDS).map(|shard| self.request(move |r| Command::GetProviders(key(shard), r)));
+        let mut found = HashSet::new();
+        for result in futures::future::join_all(lookups).await {
+            found.extend(result?);
+        }
+        Ok(found)
     }
 
     async fn request<T>(&self, make: impl FnOnce(Reply<T>) -> Command) -> anyhow::Result<T> {
@@ -343,8 +509,8 @@ impl NodeHandle {
 pub fn spawn(identity: Identity, config: NodeConfig) -> anyhow::Result<Node> {
     let peer_id = identity.peer_id();
     let keypair = identity.keypair.clone();
-    let noise_public = identity.exit_static.public;
-    let exit_private = identity.exit_static.private;
+    // Made fresh for every node and never stored; see crate::identity.
+    let exit_keys = Arc::new(ExitKeys::new()?);
     let mut swarm = build_swarm(identity.keypair, &config)?;
 
     for addr in &config.listen {
@@ -374,11 +540,16 @@ pub fn spawn(identity: Identity, config: NodeConfig) -> anyhow::Result<Node> {
 
     let mut control = swarm.behaviour().stream.new_control();
     let (tx, rx) = mpsc::channel(64);
+    let datagrams = match config.datagram_port {
+        Some(port) => Some(datagram::Socket::bind(port).context("binding the datagram socket")?),
+        None => None,
+    };
     let handle = NodeHandle {
         peer_id,
         tx,
         control: control.clone(),
         data_dir: config.data_dir.clone(),
+        datagrams,
     };
 
     if config.relay {
@@ -395,7 +566,7 @@ pub fn spawn(identity: Identity, config: NodeConfig) -> anyhow::Result<Node> {
             let incoming = control.accept(EXIT_PROTOCOL).map_err(|_| anyhow!("exit protocol already registered"))?;
             let (sessions_tx, sessions_rx) = mpsc::channel(exit.max_sessions.max(1));
             let pool = IpPool::default();
-            tokio::spawn(circuit::serve_exit(incoming, exit_private, exit.max_sessions, pool.clone(), sessions_tx));
+            tokio::spawn(circuit::serve_exit(handle.clone(), incoming, peer_id, exit_keys.clone(), exit.max_sessions, pool.clone(), sessions_tx));
             (Some(sessions_rx), Some(pool))
         }
         None => (None, None),
@@ -405,7 +576,7 @@ pub fn spawn(identity: Identity, config: NodeConfig) -> anyhow::Result<Node> {
         swarm,
         config,
         keypair,
-        noise_public,
+        exit_keys,
         nat: NatState::Unknown,
         hop_relays: HashMap::new(),
         relay_listeners: HashMap::new(),
@@ -417,6 +588,9 @@ pub fn spawn(identity: Identity, config: NodeConfig) -> anyhow::Result<Node> {
         pending_records: HashMap::new(),
         exit_published: None,
         relay_published: None,
+        observed: ObservedAddrs::default(),
+        exit_pending: None,
+        exit_failed_at: None,
     };
     let task = tokio::spawn(driver.run(rx));
     Ok(Node {
@@ -443,6 +617,7 @@ fn build_swarm(keypair: Keypair, config: &NodeConfig) -> anyhow::Result<Swarm<Be
 
                 let mut kad_config = kad::Config::new(KAD_PROTOCOL);
                 kad_config
+                    .set_max_packet_size(KAD_MAX_PACKET)
                     .disjoint_query_paths(true)
                     // Every insert is validated in `Driver::on_kad_inbound`.
                     .set_record_filtering(kad::StoreInserts::FilterBoth)
@@ -451,7 +626,12 @@ fn build_swarm(keypair: Keypair, config: &NodeConfig) -> anyhow::Result<Swarm<Be
                     // We republish fresh, re-signed records ourselves.
                     .set_publication_interval(None)
                     .set_provider_publication_interval(None);
-                let kad = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), kad_config);
+                let store_config = kad::store::MemoryStoreConfig {
+                    max_providers_per_key: records::MAX_PROVIDERS_PER_KEY,
+                    ..Default::default()
+                };
+                let store = MemoryStore::with_config(peer_id, store_config);
+                let kad = kad::Behaviour::with_config(peer_id, store, kad_config);
 
                 let mdns = if enable_mdns {
                     Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?)
@@ -470,7 +650,12 @@ fn build_swarm(keypair: Keypair, config: &NodeConfig) -> anyhow::Result<Swarm<Be
                     },
                 );
 
+                let limits = libp2p::connection_limits::ConnectionLimits::default()
+                    .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
+                    .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING))
+                    .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER));
                 Ok(Behaviour {
+                    limits: libp2p::connection_limits::Behaviour::new(limits),
                     kad,
                     identify: identify::Behaviour::new(identify::Config::new(
                         IDENTIFY_PROTOCOL.to_string(),
@@ -495,7 +680,7 @@ struct Driver {
     swarm: Swarm<Behaviour>,
     config: NodeConfig,
     keypair: Keypair,
-    noise_public: [u8; 32],
+    exit_keys: Arc<ExitKeys>,
     nat: NatState,
     /// Connected peers offering Circuit Relay v2, with a direct address for each.
     hop_relays: HashMap<PeerId, Multiaddr>,
@@ -508,8 +693,12 @@ struct Driver {
     pending_dials: HashMap<ConnectionId, Reply<Result<Multiaddr, String>>>,
     pending_providers: HashMap<kad::QueryId, (HashSet<PeerId>, Reply<HashSet<PeerId>>)>,
     pending_records: HashMap<kad::QueryId, (Vec<kad::Record>, Reply<Vec<kad::Record>>)>,
-    exit_published: Option<(Instant, Vec<Multiaddr>)>,
+    /// When, with which addresses and Noise key.
+    exit_published: Option<(Instant, Vec<Multiaddr>, [u8; 32])>,
     relay_published: Option<Instant>,
+    observed: ObservedAddrs,
+    exit_pending: Option<PendingPublish>,
+    exit_failed_at: Option<Instant>,
 }
 
 impl Driver {
@@ -535,6 +724,9 @@ impl Driver {
                 },
                 _ = publish_timer.tick() => {
                     self.reserve_relays();
+                    if self.config.exit.is_some() && self.exit_keys.rotate_if_due() {
+                        info!("new exit key; publishing it");
+                    }
                     self.publish();
                 }
                 _ = cache_timer.tick() => self.save_cache(),
@@ -546,6 +738,15 @@ impl Driver {
         match command {
             Command::ListenAddrs(reply) => {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
+            }
+            Command::RelayAddrs(reply) => {
+                let addrs = self
+                    .hop_relays
+                    .iter()
+                    .filter(|(peer, _)| self.connections.contains_key(peer))
+                    .map(|(peer, addr)| addr.clone().with(Protocol::P2p(*peer)))
+                    .collect();
+                let _ = reply.send(addrs);
             }
             Command::RoutingPeers(reply) => {
                 let _ = reply.send(self.routing_table().into_iter().map(|(p, _)| p).collect());
@@ -568,7 +769,9 @@ impl Driver {
                     exit_published: self
                         .exit_published
                         .as_ref()
-                        .is_some_and(|(at, _)| at.elapsed() < RECORD_LIFETIME),
+                        .is_some_and(|(at, _, _)| at.elapsed() < RECORD_LIFETIME),
+                    observed_addrs: self.observed.addrs(),
+                    confirmed_public_ip: self.observed.confirmed,
                 });
             }
             Command::Dial {
@@ -603,6 +806,17 @@ impl Driver {
             Command::GetRecords(key, reply) => {
                 let id = self.swarm.behaviour_mut().kad.get_record(key);
                 self.pending_records.insert(id, (Vec::new(), reply));
+            }
+            Command::AddPeer(peer, addr, reply) => {
+                if peer != *self.swarm.local_peer_id() {
+                    self.swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+                    let opts = DialOpts::peer_id(peer).addresses(vec![addr]).build();
+                    if let Err(e) = self.swarm.dial(opts) {
+                        debug!("dialling the new bootstrap peer: {}", addrs::redact(&e.to_string()));
+                    }
+                    let _ = self.swarm.behaviour_mut().kad.bootstrap();
+                }
+                let _ = reply.send(());
             }
             Command::Shutdown(_) => unreachable!("handled in run"),
         }
@@ -674,6 +888,14 @@ impl Driver {
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                // A peer may lie about this. Alone, the worst it can do is make our exit
+                // refuse one more destination (only a few are kept); an address counts
+                // as ours only once several peers agree.
+                if let Some(IpAddr::V4(ip)) = addrs::ip_of(&info.observed_addr)
+                    && addrs::is_public_v4(ip)
+                {
+                    self.observed.record(ip, peer_id);
+                }
                 if info.protocols.contains(&KAD_PROTOCOL) {
                     // A peer chooses what it advertises; loopback or LAN addresses would
                     // make others dial their own machines and networks.
@@ -728,13 +950,14 @@ impl Driver {
                 if let Some(entry) = self.relay_listeners.get_mut(&relay_peer_id) {
                     entry.1 = true;
                 }
-                info!(relay = %relay_peer_id, "reachable through relay");
+                info!("reachable through a relay");
+                debug!(relay = %relay_peer_id, "relay reservation accepted");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
                 if event.result.is_ok() {
                     self.hole_punches += 1;
                 }
-                info!(peer_id = %event.remote_peer_id, ok = event.result.is_ok(), "hole punch attempt");
+                debug!(peer_id = %event.remote_peer_id, ok = event.result.is_ok(), "hole punch attempt");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(event)) => self.on_kad(event),
             _ => {}
@@ -779,10 +1002,39 @@ impl Driver {
                     }
                 }
                 kad::QueryResult::GetRecord(_) => self.finish_records(id),
+                kad::QueryResult::PutRecord(result) => self.on_publish_step(id, result.is_ok()),
+                kad::QueryResult::StartProviding(result) => self.on_publish_step(id, result.is_ok()),
                 kad::QueryResult::Bootstrap(Err(e)) => debug!("bootstrap step failed: {e:?}"),
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// Records the outcome of one half of an exit-record publication.
+    fn on_publish_step(&mut self, id: kad::QueryId, ok: bool) {
+        let Some(pending) = self.exit_pending.as_mut() else {
+            return;
+        };
+        if id == pending.put {
+            pending.put_ok = Some(ok);
+        } else if id == pending.provide {
+            pending.provide_ok = Some(ok);
+        } else {
+            return;
+        }
+        let (Some(put), Some(provide)) = (pending.put_ok, pending.provide_ok) else {
+            return;
+        };
+        let pending = self.exit_pending.take().expect("checked");
+        if put && provide {
+            self.exit_published = Some((pending.at, pending.addrs, pending.key));
+            self.exit_failed_at = None;
+            info!("published exit record");
+        } else {
+            // A still valid earlier publication keeps counting until it expires.
+            warn!("publishing the exit record failed; retrying in {} s", PUBLISH_RETRY.as_secs());
+            self.exit_failed_at = Some(Instant::now());
         }
     }
 
@@ -899,14 +1151,20 @@ impl Driver {
             let blocked_tcp_ports = exit.blocked_tcp_ports.clone();
             let kind = exit.kind;
             let addrs = self.advertised_addrs();
-            let due = match &self.exit_published {
-                None => true,
-                Some((at, published)) => now.duration_since(*at) >= REPUBLISH_INTERVAL || *published != addrs,
-            };
+            let key = self.exit_keys.public();
+            let retry_due = self.exit_failed_at.is_none_or(|at| now.duration_since(at) >= PUBLISH_RETRY);
+            let due = self.exit_pending.is_none()
+                && retry_due
+                && match &self.exit_published {
+                    None => true,
+                    Some((at, published, published_key)) => {
+                        now.duration_since(*at) >= REPUBLISH_INTERVAL || *published != addrs || *published_key != key
+                    }
+                };
             if due && !addrs.is_empty() {
                 let record = ExitRecord {
                     peer_id: *self.swarm.local_peer_id(),
-                    noise_static: self.noise_public,
+                    noise_static: key,
                     addrs: addrs.clone(),
                     blocked_tcp_ports,
                     kind,
@@ -914,17 +1172,34 @@ impl Driver {
                 };
                 match record.sign(&self.keypair) {
                     Ok(signed) => {
+                        let shard = records::shard_of(self.swarm.local_peer_id());
                         let kad = &mut self.swarm.behaviour_mut().kad;
-                        let _ = kad.put_record(signed, kad::Quorum::One);
-                        let _ = kad.start_providing(kad::RecordKey::new(&EXIT_PROVIDER_KEY));
-                        self.exit_published = Some((now, addrs));
-                        info!("published exit record");
+                        let put = kad.put_record(signed, kad::Quorum::One);
+                        let provide = kad.start_providing(records::exit_provider_key(shard));
+                        match (put, provide) {
+                            (Ok(put), Ok(provide)) => {
+                                self.exit_pending = Some(PendingPublish {
+                                    put,
+                                    provide,
+                                    put_ok: None,
+                                    provide_ok: None,
+                                    at: now,
+                                    addrs,
+                                    key,
+                                });
+                            }
+                            _ => {
+                                warn!("could not publish the exit record; retrying in {} s", PUBLISH_RETRY.as_secs());
+                                self.exit_failed_at = Some(now);
+                            }
+                        }
                     }
                     Err(e) => warn!("could not sign exit record: {e:#}"),
                 }
             }
         }
 
+        let local = *self.swarm.local_peer_id();
         if self.config.relay && self.reachable_publicly() {
             let due = self.relay_published.is_none_or(|at| now.duration_since(at) >= REPUBLISH_INTERVAL);
             if due {
@@ -932,7 +1207,7 @@ impl Driver {
                     .swarm
                     .behaviour_mut()
                     .kad
-                    .start_providing(kad::RecordKey::new(&RELAY_PROVIDER_KEY));
+                    .start_providing(records::relay_provider_key(records::shard_of(&local)));
                 self.relay_published = Some(now);
                 info!("announced as relay");
             }
@@ -960,5 +1235,30 @@ impl Driver {
         if let Err(e) = peer_cache::save(&self.config.data_dir, &peers) {
             warn!("could not save peer cache: {e:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_public_address_counts_once_two_peers_agree() {
+        let (a, b, liar) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let (home, new_home, fake) = (Ipv4Addr::new(81, 2, 3, 4), Ipv4Addr::new(81, 2, 9, 9), Ipv4Addr::new(9, 9, 9, 9));
+        let mut observed = ObservedAddrs::default();
+        observed.record(home, a);
+        observed.record(home, a);
+        assert_eq!(observed.confirmed, None, "one peer, however often, isn't enough");
+        observed.record(home, b);
+        assert_eq!(observed.confirmed, Some(home));
+        observed.record(fake, liar);
+        assert_eq!(observed.confirmed, Some(home), "a single liar can't move it");
+        assert_eq!(observed.addrs(), [home, fake], "but every report is refused as a destination");
+        observed.record(new_home, a);
+        observed.record(new_home, b);
+        assert_eq!(observed.confirmed, Some(new_home), "the provider assigned a new address");
+        observed.record(home, liar);
+        assert_eq!(observed.confirmed, Some(new_home), "an old address doesn't come back");
     }
 }

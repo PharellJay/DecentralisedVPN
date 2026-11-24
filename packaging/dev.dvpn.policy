@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD polkit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<!-- Who may control the dvpn service (connect, disconnect, lend) through its app.
+     Like NetworkManager's VPN control: whoever is signed in at this computer, without a
+     password. Members of the dvpn group are always allowed by the service itself.
+     Administrators can narrow this with a rule in /etc/polkit-1/rules.d/. -->
+<policyconfig>
+  <vendor>dvpn</vendor>
+  <action id="dev.dvpn.control">
+    <description>Control the dvpn VPN</description>
+    <message>Authentication is required to control the dvpn VPN</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <!-- The service (user dvpn, not root) asks polkit about the app's process. -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:dvpn</annotate>
+  </action>
+</policyconfig>

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Removes what lending leaves behind if dvpn didn't shut down cleanly (or what
+# Removes what dvpn leaves behind if it didn't shut down cleanly (or what
 # scripts/exit-setup.sh installed): the dvpn nftables table, dvpn's policy-routing
-# rules and table, and, if exit-setup.sh saved it, the previous IPv4 forwarding
-# setting. Run as root.
+# rules and table, the client's kill switch (dvpn-client tables, IPv6 blackholes),
+# and, if exit-setup.sh saved it, the previous IPv4 forwarding setting. Run as root.
 set -euo pipefail
 
 STATE="${DVPN_STATE_FILE:-/run/dvpn-exit.state}"
@@ -18,6 +18,15 @@ else
     echo "no dvpn nftables table found"
 fi
 
+for family in ip ip6; do
+    if nft list table "$family" dvpn-client >/dev/null 2>&1; then
+        nft delete table "$family" dvpn-client
+        echo "removed the kill switch ($family dvpn-client)"
+    fi
+done
+ip -6 route del blackhole ::/1 2>/dev/null || true
+ip -6 route del blackhole 8000::/1 2>/dev/null || true
+
 removed=0
 for pref in "${RULE_PREFS[@]}"; do
     while ip -4 rule del pref "$pref" 2>/dev/null; do removed=$((removed + 1)); done
@@ -27,9 +36,12 @@ echo "removed $removed dvpn routing rules"
 
 # dvpn itself saves the original setting per network namespace.
 NS_ID=$(readlink /proc/self/ns/net | tr -dc '0-9')
-if [[ ! -f "$STATE" && -f "/run/dvpn-ip-forward-$NS_ID" ]]; then
-    STATE="/run/dvpn-ip-forward-$NS_ID"
-fi
+# The service keeps it in its runtime directory; `dvpn run`/`connect` in /run.
+for saved in "/run/dvpn-state/dvpn-ip-forward-$NS_ID" "/run/dvpn-ip-forward-$NS_ID"; do
+    if [[ ! -f "$STATE" && -f "$saved" ]]; then
+        STATE="$saved"
+    fi
+done
 if [[ -f "$STATE" ]]; then
     sysctl -qw net.ipv4.ip_forward="$(cat "$STATE")"
     echo "restored ip_forward=$(cat "$STATE")"

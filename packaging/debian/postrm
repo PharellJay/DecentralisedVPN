@@ -1,6 +1,19 @@
 #!/bin/sh
 set -e
 
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    # A kill switch left by a service that crashed while connected would otherwise keep
+    # blocking traffic after the package is gone.
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table ip dvpn-client 2>/dev/null || true
+        nft delete table ip6 dvpn-client 2>/dev/null || true
+    fi
+    if command -v ip >/dev/null 2>&1; then
+        ip -6 route del blackhole ::/1 2>/dev/null || true
+        ip -6 route del blackhole 8000::/1 2>/dev/null || true
+    fi
+fi
+
 if [ "$1" = "purge" ]; then
     # The node's identity keys, peer cache and settings.
     rm -rf /var/lib/dvpn

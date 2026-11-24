@@ -99,6 +99,17 @@ async fn tunnel_pair(
     client_key: Option<[u8; 32]>,
     meddle: Meddle,
 ) -> (Result<Tunnel, CircuitError>, Result<Tunnel, CircuitError>, Arc<Mutex<Seen>>) {
+    tunnel_pair_expecting(client_key, None, meddle).await
+}
+
+/// Like [`tunnel_pair`], with the client expecting exit `client_exit` (by default the
+/// exit's real peer ID).
+async fn tunnel_pair_expecting(
+    client_key: Option<[u8; 32]>,
+    client_exit: Option<libp2p::PeerId>,
+    meddle: Meddle,
+) -> (Result<Tunnel, CircuitError>, Result<Tunnel, CircuitError>, Arc<Mutex<Seen>>) {
+    let exit_id = libp2p::PeerId::random();
     let params = dvpn::identity::NOISE_PARAMS.parse().unwrap();
     let exit_keys = snow::Builder::new(params).generate_keypair().unwrap();
     let exit_public: [u8; 32] = exit_keys.public.as_slice().try_into().unwrap();
@@ -113,9 +124,10 @@ async fn tunnel_pair(
 
     let key_used_by_client = client_key.unwrap_or(exit_public);
     let exit_private = exit_keys.private.clone();
+    let exit_seen_by_client = client_exit.unwrap_or(exit_id);
     let (client, exit) = tokio::join!(
-        client_handshake(Compat(client_end), &key_used_by_client),
-        exit_handshake(Compat(exit_end), &exit_private, Ipv4Addr::new(10, 77, 0, 2), None),
+        client_handshake(Compat(client_end), &exit_seen_by_client, &key_used_by_client),
+        exit_handshake(Compat(exit_end), &exit_id, std::slice::from_ref(&exit_private), Ipv4Addr::new(10, 77, 0, 2), None),
     );
     (client, exit, seen)
 }
@@ -181,9 +193,94 @@ async fn impostor_exit_cannot_complete_handshake() {
 }
 
 #[tokio::test]
+async fn handshake_is_bound_to_the_exits_peer_id() {
+    // Right key, but the client meant to reach another exit (e.g. a record reusing the key).
+    let (client, exit, _) = tunnel_pair_expecting(None, Some(libp2p::PeerId::random()), Meddle::None).await;
+    assert!(exit.is_err() || client.is_err(), "handshake completed for the wrong exit");
+}
+
+#[tokio::test]
+async fn keys_are_renewed_during_long_sessions() {
+    let (client, exit, _) = tunnel_pair(None, Meddle::None).await;
+    let (mut client, mut exit) = (client.unwrap(), exit.unwrap());
+    // Past two key changes in each direction; every packet still arrives intact.
+    let rounds = 2 * dvpn::circuit::REKEY_EVERY + 3;
+    let sender = tokio::spawn(async move {
+        for i in 0..rounds {
+            client.tx.send(&i.to_be_bytes()).await.unwrap();
+        }
+        client
+    });
+    for i in 0..rounds {
+        assert_eq!(exit.rx.recv().await.unwrap().unwrap(), i.to_be_bytes());
+    }
+    let mut client = sender.await.unwrap();
+    exit.tx.send(SECRET).await.unwrap();
+    assert_eq!(client.rx.recv().await.unwrap().unwrap(), SECRET);
+}
+
+#[tokio::test]
 async fn oversized_packet_is_refused() {
     let (client, _exit, _) = tunnel_pair(None, Meddle::None).await;
     let mut client = client.unwrap();
     let too_big = vec![0u8; dvpn::circuit::MTU as usize + 1];
     assert!(matches!(client.tx.send(&too_big).await, Err(CircuitError::PacketTooLarge)));
+}
+
+/// Throughput of the stream path alone (PERF-01), over an in-memory pipe:
+/// `cargo test --release --test tunnel_crypto -- --ignored --nocapture throughput`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "benchmark"]
+async fn throughput() {
+    const PACKETS: usize = 200_000;
+    let exit_id = libp2p::PeerId::random();
+    let params = dvpn::identity::NOISE_PARAMS.parse().unwrap();
+    let keys = snow::Builder::new(params).generate_keypair().unwrap();
+    let public: [u8; 32] = keys.public.as_slice().try_into().unwrap();
+    let (client_end, exit_end) = tokio::io::duplex(256 * 1024);
+    let (client, exit) = tokio::join!(
+        client_handshake(Compat(client_end), &exit_id, &public),
+        exit_handshake(Compat(exit_end), &exit_id, std::slice::from_ref(&keys.private), Ipv4Addr::new(10, 77, 0, 2), None),
+    );
+    let (mut client, mut exit) = (client.unwrap(), exit.unwrap());
+    let packet = vec![0x45; 1300];
+    let start = std::time::Instant::now();
+    let sender = tokio::spawn(async move {
+        for _ in 0..PACKETS {
+            client.tx.send(&packet).await.unwrap();
+        }
+        client
+    });
+    for _ in 0..PACKETS {
+        assert_eq!(exit.rx.recv().await.unwrap().unwrap().len(), 1300);
+    }
+    let elapsed = start.elapsed();
+    drop(sender.await.unwrap());
+    let mbit = (PACKETS * 1300 * 8) as f64 / elapsed.as_secs_f64() / 1e6;
+    eprintln!("{PACKETS} packets in {elapsed:.2?}: {mbit:.0} Mbit/s, {:.2} µs/packet", elapsed.as_secs_f64() * 1e6 / PACKETS as f64);
+}
+
+/// An exit that replaced its key still accepts clients holding a record with the old
+/// one, and refuses a key it never had.
+#[tokio::test]
+async fn exit_accepts_the_key_it_just_replaced() {
+    let exit_id = libp2p::PeerId::random();
+    let keys = dvpn::identity::ExitKeys::with_lifetimes(std::time::Duration::ZERO, std::time::Duration::from_secs(3600)).unwrap();
+    let old_public = keys.public();
+    assert!(keys.rotate_if_due());
+    let stranger = dvpn::identity::ExitStaticKey::generate().unwrap().public;
+    for (client_key, accepted) in [(keys.public(), true), (old_public, true), (stranger, false)] {
+        let (client_end, exit_end) = tokio::io::duplex(64 * 1024);
+        let candidates = keys.candidates();
+        let (client, exit) = tokio::join!(
+            client_handshake(Compat(client_end), &exit_id, &client_key),
+            exit_handshake(Compat(exit_end), &exit_id, &candidates, Ipv4Addr::new(10, 77, 0, 2), None),
+        );
+        assert_eq!(exit.is_ok(), accepted);
+        if accepted {
+            let (mut client, mut exit) = (client.unwrap(), exit.unwrap());
+            client.tx.send(SECRET).await.unwrap();
+            assert_eq!(exit.rx.recv().await.unwrap().unwrap(), SECRET);
+        }
+    }
 }

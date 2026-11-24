@@ -52,6 +52,8 @@ async fn node_behind_nat_reserves_a_relay_and_is_reachable_through_it() {
     })
     .await;
     assert!(status.external_addrs.iter().all(is_circuit), "only relayed addresses expected");
+    // The relay is what an invite from this node would contain.
+    assert_eq!(natted.handle.relay_addrs().await.unwrap(), [relay.addr.clone().unwrap()]);
 
     // A third node with no prior contact reaches the NATed node via the relay.
     let outsider = start(Opts {
@@ -119,7 +121,21 @@ async fn exit_behind_nat_serves_circuits() {
     assert_eq!(session.via_peer, entry.handle.peer_id());
 
     circuit.tunnel.tx.send(b"ping through NAT").await.unwrap();
-    assert_eq!(session.tunnel.rx.recv().await.unwrap().unwrap(), b"ping through NAT");
+    assert_eq!(common::next_packet(&mut session.tunnel).await, b"ping through NAT");
     session.tunnel.tx.send(b"pong").await.unwrap();
-    assert_eq!(circuit.tunnel.rx.recv().await.unwrap().unwrap(), b"pong");
+    assert_eq!(common::next_packet(&mut circuit.tunnel).await, b"pong");
+}
+
+#[tokio::test]
+async fn bootstrap_peer_added_while_running_is_used_at_once() {
+    let a = common::start(Opts::default()).await;
+    let b = common::start(Opts::default()).await;
+    assert!(b.handle.routing_peers().await.unwrap().is_empty());
+    b.handle.add_peer(a.addr.as_ref().unwrap()).await.unwrap();
+    let a_id = a.handle.peer_id();
+    common::wait_for("the new bootstrap peer in the routing table", || {
+        let handle = b.handle.clone();
+        async move { handle.routing_peers().await.unwrap().contains(&a_id).then_some(()) }
+    })
+    .await;
 }

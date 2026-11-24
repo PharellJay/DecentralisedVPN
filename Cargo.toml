@@ -1,6 +1,6 @@
 [package]
 name = "dvpn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Decentralised peer-to-peer VPN"
@@ -37,6 +37,8 @@ libp2p = { version = "0.57.1", features = [
     "ed25519",
 ] }
 libp2p-stream = "0.5.0-alpha"
+blake2 = { version = "0.10.6", default-features = false }
+chacha20poly1305 = { version = "0.10.1", default-features = false }
 postcard = { version = "1.1.3", features = ["use-std"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -49,9 +51,21 @@ tun-rs = { version = "2.8.16", features = ["async"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zeroize = "1.9.1"
 
+# Read routes and addresses from the kernel (src/platform/linux/netlink.rs). Already
+# used by libp2p, at these versions.
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "0.8.2"
+netlink-packet-route = "0.28.0"
+netlink-sys = "0.8.8"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [package.metadata.deb]
 maintainer = "Pharell Jay Jeyakumar <pharelljeyakumar1010@gmail.com>"
@@ -69,12 +83,15 @@ This package runs dvpn as a systemd service, idle until it is asked to lend or \
 connect, or set to lend from boot. Members of the dvpn group control it with the \
 dvpn app (the dvpn-gui package), without sudo."""
 depends = "$auto, iproute2, nftables, systemd"
-recommends = "systemd-resolved"
+# polkitd lets whoever is signed in use the app without joining the dvpn group.
+recommends = "systemd-resolved, polkitd | policykit-1"
 maintainer-scripts = "packaging/debian/"
 assets = [
     # Not on PATH: only systemd runs it, and the app is how people use dvpn.
     ["target/release/dvpn", "usr/libexec/dvpn/", "755"],
     ["packaging/default", "etc/default/dvpn", "644"],
+    ["packaging/dev.dvpn.policy", "usr/share/polkit-1/actions/", "644"],
+    ["packaging/dvpn.rules", "usr/share/polkit-1/rules.d/60-dvpn.rules", "644"],
     ["scripts/exit-teardown.sh", "usr/share/dvpn/", "755"],
     ["README.md", "usr/share/doc/dvpn/", "644"],
     ["docs/DESIGN.md", "usr/share/doc/dvpn/", "644"],

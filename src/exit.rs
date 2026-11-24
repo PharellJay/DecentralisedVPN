@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -29,21 +29,40 @@ pub struct ExitOptions {
     pub rate_mbps: u64,
 }
 
-type Routes = Arc<Mutex<HashMap<Ipv4Addr, mpsc::Sender<Vec<u8>>>>>;
+/// Which session owns each virtual address. Read for every return packet, written only
+/// when sessions start and end.
+type Routes = Arc<RwLock<HashMap<Ipv4Addr, mpsc::Sender<Vec<u8>>>>>;
 
 /// Forwards every session from `sessions` through `device` until `sessions` closes.
 pub async fn forward<D: PacketDevice>(
     device: Arc<D>,
+    sessions: mpsc::Receiver<ExitSession>,
+    options: Arc<ExitOptions>,
+    active: Arc<AtomicUsize>,
+) {
+    forward_queues(vec![device], sessions, options, active).await;
+}
+
+/// Like [`forward`], over the queues of a multi-queue device: each queue has its own
+/// reader, and sessions are spread over the queues for writing.
+pub async fn forward_queues<D: PacketDevice>(
+    queues: Vec<Arc<D>>,
     mut sessions: mpsc::Receiver<ExitSession>,
     options: Arc<ExitOptions>,
     active: Arc<AtomicUsize>,
 ) {
+    assert!(!queues.is_empty(), "a device has at least one queue");
     let routes: Routes = Arc::default();
-    let reader = tokio::spawn(read_device(device.clone(), routes.clone()));
+    let readers: Vec<_> = queues.iter().map(|queue| tokio::spawn(read_device(queue.clone(), routes.clone()))).collect();
+    let mut next = 0;
     while let Some(session) = sessions.recv().await {
-        tokio::spawn(serve_session(session.tunnel, device.clone(), routes.clone(), options.clone(), active.clone()));
+        let queue = queues[next % queues.len()].clone();
+        next += 1;
+        tokio::spawn(serve_session(session.tunnel, queue, routes.clone(), options.clone(), active.clone()));
     }
-    reader.abort();
+    for reader in readers {
+        reader.abort();
+    }
 }
 
 /// Delivers return traffic from the TUN device to the owning session.
@@ -58,8 +77,8 @@ async fn read_device<D: PacketDevice>(device: Arc<D>, routes: Routes) {
             }
         };
         let Some(info) = packet::parse(&buf[..n]) else { continue };
-        let session = routes.lock().expect("routes lock").get(&info.dst).cloned();
-        if let Some(session) = session {
+        let routes = routes.read().expect("routes lock");
+        if let Some(session) = routes.get(&info.dst) {
             // A full queue means the client is slower than its traffic; drop like a router would.
             let _ = session.try_send(buf[..n].to_vec());
         }
@@ -77,7 +96,7 @@ async fn serve_session<D: PacketDevice>(
         assigned_ip, mut tx, mut rx, ..
     } = tunnel;
     let (return_tx, mut return_rx) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
-    routes.lock().expect("routes lock").insert(assigned_ip, return_tx.clone());
+    routes.write().expect("routes lock").insert(assigned_ip, return_tx.clone());
     active.fetch_add(1, Ordering::Relaxed);
 
     let outbound = async {
@@ -115,7 +134,7 @@ async fn serve_session<D: PacketDevice>(
     }
 
     // Only remove our own entry: the address may already belong to a new session.
-    let mut routes = routes.lock().expect("routes lock");
+    let mut routes = routes.write().expect("routes lock");
     if routes.get(&assigned_ip).is_some_and(|s| s.same_channel(&return_tx)) {
         routes.remove(&assigned_ip);
     }

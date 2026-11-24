@@ -1,2 +1,3 @@
-# Members of this group may control the dvpn service (connect, disconnect, choose exits).
-g dvpn -
+# The service runs as this user, with only CAP_NET_ADMIN (packaging/dvpn.service).
+# Members of its group may control the service (connect, disconnect, choose exits).
+u dvpn - "dvpn VPN service" /var/lib/dvpn

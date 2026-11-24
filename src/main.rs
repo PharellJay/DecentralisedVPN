@@ -9,16 +9,18 @@ use clap::{Args, Parser, Subcommand};
 use dvpn::client::{self, ConnectOptions};
 use dvpn::config::{FileConfig, default_data_dir};
 use dvpn::control::{self, Client, Request, Response, SharedState};
-use dvpn::controller::{Controller, Session, StartFn};
+use dvpn::controller::{Controller, KillSwitchGuard, Session, StartFn};
 use dvpn::daemon::{self, Probe, SERVICE_DATA_DIR, SERVICE_SOCKET};
-use dvpn::identity::{Identity, IdentityError};
+use dvpn::identity::{self, Identity};
 use dvpn::lend::{self, LendOptions, Lending};
 use dvpn::logs::LogBuffer;
 use dvpn::node::{self, ExitConfig, Node, NodeConfig, Reachability};
-use dvpn::policy::DEFAULT_BLOCKED_TCP_PORTS;
+use dvpn::policy::{DEFAULT_BLOCKED_TCP_PORTS, Ports};
 use dvpn::records::ExitKind;
+use dvpn::dns::DnsOverTls;
+use dvpn::platform::service::shutdown_signal;
+use dvpn::platform::{self, tunnel::KillSwitch};
 use dvpn::select::Selection;
-use dvpn::system;
 use ipnet::Ipv4Net;
 use libp2p::Multiaddr;
 use tracing_subscriber::EnvFilter;
@@ -49,15 +51,23 @@ struct NetworkArgs {
     /// Bootstrap peer, ending in /p2p/<peer-id> (repeatable)
     #[arg(long)]
     bootstrap: Vec<Multiaddr>,
-    /// Disable LAN discovery via mDNS
+    /// Find peers on the local network via mDNS. Off by default: it announces this
+    /// computer to everyone on the network
     #[arg(long)]
-    no_mdns: bool,
+    mdns: bool,
     /// Do not read or write the local peer cache
     #[arg(long)]
     no_peer_cache: bool,
     /// Treat loopback/private addresses as usable (LAN-only networks, local testing)
     #[arg(long)]
     allow_private_addrs: bool,
+    /// UDP port for sending circuits' packets as datagrams (0: any free port). Relays
+    /// must be reachable on it; if it's taken, any free port is used
+    #[arg(long, default_value_t = dvpn::datagram::DEFAULT_PORT)]
+    datagram_port: u16,
+    /// Carry circuits' packets over streams only (no UDP datagram path)
+    #[arg(long)]
+    no_datagrams: bool,
 }
 
 /// Settings for lending your IP as an exit.
@@ -95,6 +105,10 @@ struct ConnectArgs {
     /// DNS server used through the tunnel via systemd-resolved, or "none"
     #[arg(long, default_value = "9.9.9.9")]
     dns: String,
+    /// Encrypt DNS through the tunnel (DNS-over-TLS), so the exit can't read it:
+    /// yes, opportunistic or no
+    #[arg(long, default_value = "yes")]
+    dns_over_tls: DnsOverTls,
     /// Name of the TUN device
     #[arg(long, default_value = "dvpn0")]
     tun_name: String,
@@ -106,7 +120,8 @@ struct ConnectArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a new node identity
+    /// Generate a stable node identity, for `run` (bootstrap peers, dedicated exits).
+    /// `connect` and `daemon` use a new identity for every session instead
     Init,
     /// Join the network as a relay and, with --exit, as an exit
     Run {
@@ -135,11 +150,21 @@ enum Command {
         /// Bandwidth cap per exit session and direction, in Mbit/s (0 = unlimited)
         #[arg(long, default_value_t = 20)]
         exit_rate_mbps: u64,
+        /// With --exit: serve a web page on this machine's address explaining that it's a
+        /// dvpn exit, for whoever looks it up after seeing traffic from it
+        #[arg(long, requires = "exit")]
+        exit_notice: bool,
+        /// Contact for the exit notice (e.g. an abuse address)
+        #[arg(long, requires = "exit_notice")]
+        exit_contact: Option<String>,
+        /// Where the exit notice is served
+        #[arg(long, default_value = "0.0.0.0:80", requires = "exit_notice")]
+        exit_notice_listen: std::net::SocketAddr,
     },
     /// Route this machine's traffic through the network while lending your IP as an
     /// exit in return (needs root)
     Connect(ConnectArgs),
-    /// Run as the background service that the desktop app controls (needs root;
+    /// Run as the background service that the desktop app controls (needs CAP_NET_ADMIN;
     /// started by systemd). Idle until the app asks it to lend or connect
     Daemon {
         #[command(flatten)]
@@ -159,19 +184,22 @@ async fn main() -> anyhow::Result<()> {
     // Third-party crates stay at `warn` even with --debug, since their debug output includes addresses.
     // libp2p_kad warns on every first start with an empty routing table, which is expected.
     let filter = if cli.debug { "dvpn=debug,libp2p_kad=error,warn" } else { "dvpn=info,libp2p_kad=error,warn" };
-    // The service logs to the journal and keeps recent lines for the app.
+    // The service keeps recent lines in memory for the app. The journal is written to
+    // disk, so it only gets warnings: info lines tell when the VPN was used and through
+    // which peers, which shouldn't outlive the session (--debug sends everything).
     let logs = LogBuffer::default();
-    let to_buffer = tracing_subscriber::fmt::layer()
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .without_time();
     match &command {
         Command::Daemon { .. } => {
-            let journal = tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal());
-            tracing_subscriber::registry()
-                .with(to_buffer.and_then(journal))
-                .with(EnvFilter::new(filter))
-                .init()
+            let to_buffer = tracing_subscriber::fmt::layer()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .with_filter(EnvFilter::new(filter));
+            let journal_filter = if cli.debug { filter } else { "warn,libp2p_kad=error" };
+            let journal = tracing_subscriber::fmt::layer()
+                .with_ansi(std::io::stdout().is_terminal())
+                .with_filter(EnvFilter::new(journal_filter));
+            tracing_subscriber::registry().with(to_buffer).with(journal).init()
         }
         _ => tracing_subscriber::fmt().with_env_filter(EnvFilter::new(filter)).init(),
     }
@@ -198,12 +226,20 @@ async fn main() -> anyhow::Result<()> {
             lend,
             exit_max_sessions,
             exit_rate_mbps,
+            exit_notice,
+            exit_contact,
+            exit_notice_listen,
         } => {
             if exit {
                 confirm_exit_risk(&data_dir, lend.accept_exit_risk)?;
             }
+            // Bound first: a port that's taken or needs root fails before anything starts.
+            let notice = match exit_notice {
+                true => Some(dvpn::notice::bind(exit_notice_listen).await?),
+                false => None,
+            };
             // Before any system changes, so a signal during setup still cleans up.
-            let shutdown = system::shutdown_signal()?;
+            let shutdown = shutdown_signal()?;
             let identity = Identity::load(&data_dir)?;
             let listener = control::bind(&data_dir).await?;
             let config = NodeConfig {
@@ -217,7 +253,9 @@ async fn main() -> anyhow::Result<()> {
             let mut node = node::spawn(identity, config)?;
             let mut state = SharedState::default();
             let _lending = if exit {
-                let lending = start_lending(&mut node, lend, listen, exit_max_sessions, exit_rate_mbps)?;
+                let lending =
+                    start_lending(&mut node, ExitKind::Dedicated, lend, listen, exit_max_sessions, exit_rate_mbps)?;
+                lend::watch_own_addresses(node.handle.clone(), lending.handle());
                 state.lending = Some(lending.handle());
                 Some(lending)
             } else {
@@ -225,6 +263,9 @@ async fn main() -> anyhow::Result<()> {
             };
 
             tokio::spawn(control::serve(listener, node.handle.clone(), state));
+            if let Some(notice) = notice {
+                tokio::spawn(dvpn::notice::serve(notice, dvpn::notice::page(exit_contact.as_deref())));
+            }
             println!("node {} running; press Ctrl-C to stop", node.handle.peer_id());
             tokio::select! {
                 result = node.task => result??,
@@ -232,10 +273,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Connect(args) => {
+            identity::ensure_data_dir(&data_dir)?;
             confirm_exit_risk(&data_dir, args.lend.accept_exit_risk)?;
             // Before any system changes, so a signal during setup still cleans up.
-            let shutdown = system::shutdown_signal()?;
+            let shutdown = shutdown_signal()?;
             let session = start_session(&data_dir, args, true).await?;
+            // Blocks traffic outside the tunnel from now until Ctrl-C (dropped last).
+            let kill_switch = KillSwitch::install(&session.options.tun_name)?;
             let selection = *session.state.selection.lock().expect("state lock");
             println!(
                 "node {} lending and connecting (exit selection: {selection}); press Ctrl-C to disconnect",
@@ -257,21 +301,31 @@ async fn main() -> anyhow::Result<()> {
                 () = shutdown => Ok(()),
             };
             let _ = node.handle.shutdown().await;
+            drop(kill_switch);
             drop(lending);
             outcome?;
         }
         Command::Daemon { args, socket } => {
             // Before any system changes, so a signal during setup still cleans up.
-            let shutdown = system::shutdown_signal()?;
+            let shutdown = shutdown_signal()?;
             if args.lend.accept_exit_risk && !lend::consent_given(&data_dir) {
                 lend::record_consent(&data_dir)?;
             }
             // A previous service that crashed or was killed may have left its firewall
             // and routing rules behind; the kill switch's routes went with its device.
-            if let Err(e) = lend::recover_stale_state() {
+            if let Err(e) = platform::exit::recover_stale_state() {
                 tracing::warn!("{e:#}");
             }
-            let controller = controller(&data_dir, args, logs)?;
+            // A kill switch left behind means it crashed while connected: keep blocking
+            // and connect again, rather than silently unprotecting the user.
+            let resume = platform::tunnel::kill_switch_left_behind();
+            if !resume {
+                platform::tunnel::recover_stale_state();
+            }
+            let mut controller = controller(&data_dir, args, logs)?;
+            if resume {
+                controller.resume_after_crash();
+            }
             let listener = daemon::listen(&socket).await?;
             daemon::run(controller, listener, shutdown).await;
         }
@@ -284,7 +338,7 @@ async fn main() -> anyhow::Result<()> {
             let report = match service {
                 Probe::Available(stream) => match Client::new(stream).send(&Request::Status).await? {
                     Response::Status(report) => *report,
-                    Response::Error(e) => bail!("{e}"),
+                    Response::Error(e) | Response::Denied(e) => bail!("{e}"),
                     other => bail!("unexpected answer: {other:?}"),
                 },
                 Probe::PermissionDenied => bail!("{}", daemon::permission_help()),
@@ -296,25 +350,30 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The service's controller. Creates the identity on first use.
+/// The service's controller.
 fn controller(data_dir: &Path, args: ConnectArgs, logs: LogBuffer) -> anyhow::Result<Controller> {
     parse_dns(&args.dns)?; // Checked now rather than at the first connect.
-    let identity = match Identity::load(data_dir) {
-        Ok(identity) => identity,
-        Err(IdentityError::NotFound(_)) => Identity::init(data_dir)?,
-        Err(e) => return Err(e.into()),
-    };
+    identity::ensure_data_dir(data_dir)?;
     let selection = match args.max_ping {
         Some(ms) => Selection::MaxPing(Duration::from_millis(ms)),
         None => Selection::Random,
     };
+    let tun_name = args.tun_name.clone();
     let dir = data_dir.to_path_buf();
     let start: StartFn = Box::new(move || {
         let (dir, args) = (dir.clone(), args.clone());
         // The service has its own socket, so no `<data-dir>/control.sock`.
         Box::pin(async move { start_session(&dir, args, false).await })
     });
-    Ok(Controller::new(data_dir, identity.peer_id().to_string(), selection, logs, start))
+    let kill_switch = Box::new(move || {
+        let switch = KillSwitch::install(&tun_name)?;
+        Ok(KillSwitchGuard {
+            filters_output: switch.filters_output(),
+            warnings: switch.warnings.clone(),
+            blocker: Box::new(switch),
+        })
+    });
+    Ok(Controller::new(data_dir, selection, logs, start).with_kill_switch(kill_switch))
 }
 
 fn parse_dns(dns: &str) -> anyhow::Result<Option<Ipv4Addr>> {
@@ -325,10 +384,11 @@ fn parse_dns(dns: &str) -> anyhow::Result<Option<Ipv4Addr>> {
 }
 
 /// Starts the node and lending for `connect` and the service, and with
-/// `status_socket` the `<data-dir>/control.sock` status socket.
+/// `status_socket` the `<data-dir>/control.sock` status socket. Every session is a new
+/// node to the network: a fresh identity, so it can't be linked to earlier ones.
 async fn start_session(data_dir: &Path, args: ConnectArgs, status_socket: bool) -> anyhow::Result<Session> {
     let dns = parse_dns(&args.dns)?;
-    let identity = Identity::load(data_dir)?;
+    let identity = Identity::ephemeral()?;
     let listener = match status_socket {
         true => Some(control::bind(data_dir).await?),
         false => None,
@@ -342,7 +402,14 @@ async fn start_session(data_dir: &Path, args: ConnectArgs, status_socket: bool) 
         ..network_config(data_dir, args.net)?
     };
     let mut node = node::spawn(identity, config)?;
-    let lending = match start_lending(&mut node, args.lend, args.listen, args.exit_max_sessions, args.exit_rate_mbps) {
+    let lending = match start_lending(
+        &mut node,
+        ExitKind::User,
+        args.lend,
+        args.listen,
+        args.exit_max_sessions,
+        args.exit_rate_mbps,
+    ) {
         Ok(lending) => lending,
         Err(e) => {
             // Frees the listen ports, so the service can try again.
@@ -360,6 +427,7 @@ async fn start_session(data_dir: &Path, args: ConnectArgs, status_socket: bool) 
         selection: Arc::new(Mutex::new(selection)),
         ..SharedState::default()
     };
+    lend::watch_own_addresses(node.handle.clone(), lending.handle());
     let status_server = listener.map(|listener| tokio::spawn(control::serve(listener, node.handle.clone(), state.clone())));
     Ok(Session {
         node,
@@ -368,6 +436,7 @@ async fn start_session(data_dir: &Path, args: ConnectArgs, status_socket: bool) 
         options: ConnectOptions {
             tun_name: args.tun_name,
             dns,
+            dns_over_tls: args.dns_over_tls,
         },
         status_server,
     })
@@ -383,13 +452,14 @@ fn network_config(data_dir: &Path, net: NetworkArgs) -> anyhow::Result<NodeConfi
         data_dir: data_dir.to_path_buf(),
         listen: vec![],
         bootstrap,
-        mdns: !net.no_mdns,
+        mdns: net.mdns,
         peer_cache: !net.no_peer_cache,
         reachability: Reachability::Auto,
         relay: false,
         relay_rate_mbps: 0,
         exit: None,
         allow_private_addrs: net.allow_private_addrs,
+        datagram_port: (!net.no_datagrams).then_some(net.datagram_port),
     })
 }
 
@@ -404,6 +474,7 @@ fn exit_config(kind: ExitKind, max_sessions: usize) -> ExitConfig {
 /// Brings up lending for a node spawned with [`exit_config`].
 fn start_lending(
     node: &mut Node,
+    kind: ExitKind,
     lend: LendArgs,
     listen: Vec<Multiaddr>,
     max_sessions: usize,
@@ -411,16 +482,26 @@ fn start_lending(
 ) -> anyhow::Result<Lending> {
     let sessions = node.exit_sessions.take().context("node has no exit")?;
     let pool = node.exit_pool.take().context("node has no exit")?;
+    // Our datagrams to relays bypass our own tunnel, like replies from the listen ports.
+    let mut listen = listen;
+    if let Some(port) = node.handle.datagram_port() {
+        listen.push(format!("/ip4/0.0.0.0/udp/{port}").parse().expect("valid multiaddr"));
+    }
     Lending::start(
         sessions,
         pool,
         LendOptions {
             wan: lend.wan,
             extra_deny: lend.exit_deny,
-            blocked_tcp_ports: DEFAULT_BLOCKED_TCP_PORTS.to_vec(),
+            ports: Ports::for_kind(kind),
             rate_mbps,
             max_sessions,
             listen,
+            // Users' exits carry a handful of sessions; servers spread theirs over cores.
+            tun_queues: match kind {
+                ExitKind::User => 1,
+                ExitKind::Dedicated => std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+            },
         },
     )
 }
@@ -431,6 +512,10 @@ fn confirm_exit_risk(data_dir: &Path, accepted_now: bool) -> anyhow::Result<()> 
         return Ok(());
     }
     eprintln!("{}", lend::LENDING_WARNING);
+    eprintln!(
+        "\nA dedicated exit (`run --exit`) carries more: every port except SMTP (TCP 25), \
+         and protocols other than TCP, UDP and ICMP.\n"
+    );
     if !accepted_now {
         bail!("to accept and lend your connection (required to use dvpn), re-run with --accept-exit-risk");
     }

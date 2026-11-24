@@ -46,27 +46,36 @@ traffic. There is no central server, account, or authority.
 | Exit operators are legally exposed: abuse traffic appears to come from their IP. | Exit is opt-in only, with a warning at enable time; restrictive default exit policy (no SMTP, no private ranges); per-circuit rate limits. | **Partially mitigated**. The operator still carries liability; the software cannot remove it. |
 | Timing correlation (colluding entry+exit or global observer). | Message size padding to fixed buckets; guard persistence reduces exposure over time. No cover traffic in MVP. | **Unmitigated** against a capable adversary |
 | Sybil / eclipse attacks on discovery. | Disjoint Kademlia query paths, /16 subnet diversity between hops, signed records, guard persistence, multiple bootstrap sources. | **Partially mitigated**. A well-resourced attacker can still win. No decentralised system fully solves this without a cost or identity mechanism. |
-| First-ever join needs one known peer address (or a LAN peer). | `--bootstrap` flag, config file, mDNS, cached peers from previous runs. | **Inherent** to any serverless network |
+| First-ever join needs one known peer address (or a LAN peer). | Invite links (`dvpn://join?peer=…`, §3.2) that any user can copy from the app and send, `--bootstrap` flag, config file, cached peers from previous runs, mDNS with `--mdns`. No list is built in: there's no authority to run it. | **Inherent** to any serverless network |
+| A stable node ID would let peers, relays and DHT observers recognise a computer across days and networks. | Users' nodes (`connect`, the service) use a new identity every session: on every start, restart, network change and change of public address (§3.1). mDNS, which announces the node to its LAN, is off unless `--mdns` is given. | **Mitigated**. The guard relay is kept across sessions on purpose (§3.3), so it can still link the networks a user connects from. |
 | 2 hops: a colluding entry+exit pair deanonymizes. | 3-hop circuits are planned for later. | **Unmitigated** in MVP |
 | Entry relay learns the client uses the network. | None in MVP (no bridges/obfuscation). | **Unmitigated** |
-| Traffic leaks if the tunnel drops or for IPv6. | Kill switch: route stays on TUN and packets are dropped while reconnecting; IPv6 blackholed while connected. | **Mitigated** (M3) |
+| Traffic leaks if the tunnel drops or for IPv6. | Kill switch (§3.5): a firewall lets nothing leave except through the tunnel, to the LAN or as dvpn's own traffic, from connect until disconnect; IPv6 is refused and blackholed. | **Mitigated** |
+| Routes more specific than ours, pushed by a rogue DHCP server (option 121) or router advertisement ("TunnelVision"), steer traffic around the tunnel. | The kill switch filters by outgoing interface, not by route: such traffic is refused. A LAN only counts as local up to a /16. | **Mitigated** (traffic is blocked, not leaked) |
 | The client's own DHT lookups connect directly to arbitrary peers, and one of them may be its exit. That exit then sees the client's IP doing DHT traffic and could try to correlate it with circuit timing. | Once connected, every lookup (including candidate refreshes) goes through the tunnel; only the initial discovery before the first circuit is direct. | **Partially mitigated** (M3) |
 | An exit behind NAT is reached through Circuit Relay v2, whose libp2p default limits are 2 min / 128 KiB per relayed connection, unless DCUtR hole punching upgrades it to a direct connection. | DCUtR is enabled. In practice a NATed exit holds outbound connections to the relays, which carry the splice directly. | **Partially mitigated** |
-| The kill switch only protects while `dvpn connect` runs. If the process is killed or crashes, the TUN device vanishes and normal routing resumes. | Reconnects forever instead of giving up; Ctrl-C restores routes cleanly. | **Partially mitigated** |
+| The kill switch outlives the client but not the firewall table: a reboot clears it. | The service keeps it from connect until disconnect and restarts a failed client or node by itself. After a crash, the table stays and the restarted service reconnects. Ctrl-C (or a disconnect) removes it cleanly. | **Mitigated** for the service; `dvpn connect` run by hand protects while it runs |
+| If the service crashes repeatedly while connected, traffic stays blocked until it's back (or the machine restarts). | Disconnect in the app, or `sudo systemctl restart dvpn`; removing the package removes the firewall. | **Accepted**: failing closed is the point |
+| The kill switch recognises dvpn's own traffic by its cgroup. For `dvpn connect` run by hand, that is the whole session scope it runs in, so other programs started from the same terminal session pass too. | The service has its own cgroup (`dvpn.service`). Without cgroup v2, only routes protect, and the app says so. | **Accepted** (operator tool) |
 | A silently vanished exit (host gone, no TCP reset) is only noticed when the transport times out. | End-to-end tunnel keepalive (§3.4): detected within 30–36 s; the exit also frees silent sessions after 60 s. | **Mitigated** |
-| `connect`, `run --exit` and the service run as root for their whole lifetime. | The service is sandboxed by systemd (only network capabilities, read-only system directories, no access to home directories), and the desktop app runs unprivileged (§3.12). No privilege drop inside the process yet. | **Partially mitigated** |
-| Members of the `dvpn` group can turn the VPN and lending on or off, and add bootstrap peers. | Only a fixed set of actions passes through the socket (§3.12). Joining the group needs root. | **Accepted**: it's what the group is for |
+| `connect` and `run --exit`, started by hand, run as root for their whole lifetime. | The service, which is how people use dvpn, isn't root: it runs as the system user `dvpn` with `CAP_NET_ADMIN` as its only privilege, sandboxed by systemd (read-only system directories, no home directories), and the desktop app runs unprivileged (§3.12). Taking over the service gives network administration, not the machine. | **Mitigated** for the service; the commands are for servers and tests |
+| Whoever is signed in at this computer, and members of the `dvpn` group, can turn the VPN and lending on or off, and add bootstrap peers. | Only a fixed set of actions passes through the socket (§3.12). Administrators can narrow the polkit action `dev.dvpn.control`. | **Accepted**: like NetworkManager's VPN control |
 | Every user's IP is published in the DHT as an exit (a consequence of lend-to-use), so anyone can list dvpn users. | None; it's what lending requires. It also means a complaint about an exit IP can be checked against the public exit list. | **Inherent** |
-| The bypass rule matches the listen port (4001) as a source port for any local process, so an app binding that port bypasses the tunnel. | Only root-run or deliberately configured apps bind a fixed source port. | **Accepted** |
+| The bypass rule matches the listen port (4001) as a source port for any local process, so an app binding that port bypasses the tunnel. | With the kill switch filtering output, such packets are refused unless they come from dvpn itself or answer a connection a peer started. | **Mitigated** |
 | Running `dvpn` from a user-writable build directory under sudo means whoever can write that file gets root. | Users never run it: the package installs it root-owned in `/usr/libexec/dvpn/` and only systemd starts it. Operators running `run --exit` by hand should install a root-owned copy. | **Documented** |
 | DHT query responses can still contain addresses other peers advertised. | Identify addresses are filtered (§3.8); responses come from libp2p's Kademlia and are not filtered yet. | **Partially mitigated** |
 | "Lend to use" is enforced only by the official client; a modified client can use the network without lending. | Exits can't verify it without de-anonymising clients (§3.9). | **Inherent** |
-| Every user is an exit, so every user carries an exit operator's legal exposure. | Consent required once; restrictive exit policy; lower default limits for `connect`. | **Partially mitigated**. The software cannot remove it. |
+| Every user is an exit, so every user carries an exit operator's legal exposure. | Consent required once; users' exits only carry common services (a reduced port list, §3.6), which keeps out most traffic that draws complaints (file sharing, scanning, spam); lower default limits. | **Partially mitigated**. The software cannot remove it. |
+| On another user's exit, services outside its port list (e.g. games, BitTorrent, some VoIP) don't work. | Such exits are a last resort: clients prefer dedicated exits, which forward every port but SMTP, and move to one as soon as it's up. The app says when a user's exit is in use. | **Accepted**: protects lenders |
 | libp2p dials that don't reuse the listen port go through our own tunnel while connected. They still work, just with an extra hop. | Replies from the listen ports, lent traffic and the entry relay bypass the tunnel. | **Partially mitigated** |
 | An exit's `kind` (dedicated or user) is self-declared. A node can claim to be dedicated to attract clients. | Signed with the rest of the record. It only orders exits that are all equally untrusted. | **Inherent** |
+| The datagram path's packet layer is dvpn's own composition of standard primitives, not an established protocol. | Modelled on WireGuard's data packets (AEAD per packet, counters, replay window, key ratchet); unit tests cover tampering, replays, reordering and key changes. The handshake stays Noise. | **Partially mitigated**: needs an external review |
+| Networks that block UDP (some company, hotel and public Wi-Fi) get no datagram path. | Packets stay on the circuit's stream, which works as before, just with TCP-over-TCP's stalls on lossy links. | **Mitigated** (graceful fallback) |
 | Max-ping mode narrows the set of exits a client uses, which makes its choice more predictable than random mode. | The pick is random within the limit, not the fastest. Random mode stays the default. | **Partially mitigated** (user's trade-off) |
 | Max-ping test circuits briefly use a session slot on each probed exit, and the entry relay sees several circuits open at once. | At most 8 probes per tier; unused test circuits close immediately. | **Partially mitigated** |
-| The bypass table holds the default route from when lending started. Changing networks (e.g. a different Wi-Fi) while running leaves it stale. | Restart `dvpn` after changing networks. | **Unmitigated** |
+| Lending is built for the network it started on (WAN interface, local networks, bypass table). | Lending checks every 10 s; on a change it is reported down and the service restarts it, and the VPN with it, for the new network (§3.9). `dvpn run --exit` and `dvpn connect` only report it. | **Mitigated** for the service |
+| An exit behind a home router has a public address that isn't on any of its interfaces; through hairpin NAT, clients could reach the router or port forwards into the lender's LAN. | The exit refuses the addresses peers see it at (§3.6). | **Mitigated** |
+| A DHT node keeps a limited number of providers per key and ignores newcomers once full, so whoever registers first could fill the exit and relay lists. | Provider keys are split into 8 shards, each holding 64 providers, and a node may only announce itself in its own shard (§3.2). Filling them takes hundreds of always-on nodes. | **Partially mitigated** (Sybil, see above) |
 
 ## 2. Architecture overview
 
@@ -89,9 +98,23 @@ Layers:
 ## 3. Components
 
 ### 3.1 Identity
-- `dvpn init` generates:
-  - an Ed25519 libp2p identity keypair (node ID), and
-  - an X25519 static keypair for the exit handshake (used only if the node is an exit).
+- **Users' nodes** (`connect` and the service) generate a new identity in memory for
+  every session: a new node ID and exit key on every start, restart and network change.
+  Nothing links one session to the next on the network.
+  - A new public address with nothing changed on the host (an internet provider
+    reassigning it, often daily) also starts a new session. It counts once two peers
+    report the same new address, and at most once per 30 minutes, so a router
+    alternating between uplinks can't keep the service restarting. The exit record, signed with
+  that session's key, goes with it.
+- **Servers** (`run`: bootstrap peers and dedicated exits) keep a stable identity, since
+  others reach them by it (`/p2p/<id>` in bootstrap addresses). `dvpn init` generates
+  an Ed25519 libp2p identity keypair (node ID).
+- An exit's X25519 static key for the handshake (§3.4) is never stored. Every node
+  makes a new one when it starts and replaces it every 24 h, publishing the new one in
+  its exit record right away, which the node ID signs. The replaced key is still
+  accepted for 70 minutes, as long as records with it can be valid. A key stolen from
+  a running exit thus lets an attacker impersonate it for a day at most, and no key
+  can be read from the disk. `exit_static.key` files from earlier versions are deleted.
 - Stored in `$XDG_DATA_HOME/dvpn/` (default `~/.local/share/dvpn/`): directory `0700`,
   key files `0600`. Refuse to start if permissions are looser.
 - Keys are zeroized in memory on drop (`zeroize`) and never logged.
@@ -99,15 +122,33 @@ Layers:
 ### 3.2 Discovery (no central server)
 - **Kademlia DHT** (`libp2p-kad`), with `disjoint_query_paths` enabled to resist eclipse
   attacks on lookups.
-- **mDNS** for zero-config discovery on the LAN.
+- **mDNS** for zero-config discovery on the LAN, only with `--mdns`: it announces the
+  node (and so that this computer runs dvpn) to everyone on the network.
 - **Bootstrap peers**: supplied via `--bootstrap <multiaddr>` or the config file. No
   hardcoded authority; any peer can bootstrap anyone.
+- **Invite links**: `dvpn://join?peer=<multiaddr>&peer=…` (at most 4 peers). The app
+  shows one to copy: the user's bootstrap peers, then the relays it is connected to
+  (servers with a stable ID and a public address), never the user's own node, whose
+  ID changes every session. Anything that takes a bootstrap address (the app's field,
+  `Action::AddBootstrap`) also takes a link and adds all its peers. The desktop file
+  registers the `dvpn` scheme, so clicking a link opens the app with the link filled
+  in; it is added only when the user confirms, since a stranger's link could lead to
+  peers that show a newcomer a false view of the network.
 - **Peer cache**: known-good peer addresses are saved locally (`0600`) so later runs need
-  no bootstrap. Can be disabled with `--no-peer-cache`.
+  no bootstrap. Can be disabled with `--no-peer-cache`. Each save replaces it with the
+  peers known now; if dvpn doesn't run for 30 days, its entries expire and the file is
+  deleted, like an expired guard choice (§3.3), so other users' IPs don't stay on disk.
 - **Signed records** published in the DHT:
   - `ExitRecord { peer_id, noise_static_pubkey, exit_policy_summary, expires_at }`,
-    signed by the node's Ed25519 key, under provider key `dvpn/exit/v1`.
-  - Relays advertise under provider key `dvpn/relay/v1`.
+    signed by the node's Ed25519 key. Exits announce themselves as providers of
+    `/dvpn/exit/v2/<shard>`, relays of `/dvpn/relay/v2/<shard>`.
+  - **Shards.** A node's shard is the last byte of its peer ID modulo 8, and DHT nodes
+    store a provider only under its own shard. Lookups ask all 8 in parallel. With a
+    single key, the 20 providers libp2p keeps per key by default (ignoring newcomers
+    once full) would cap the network and hand it to whoever came first; with 8 shards
+    of 64, filling them takes hundreds of always-on nodes.
+  - An exit counts as published only once the record was stored and the provider
+    entry announced; a failed attempt is retried after 30 s.
   - Records expire after 1 h and are republished. Records with an invalid signature,
     or whose `peer_id` doesn't match the signer, are dropped.
 
@@ -127,20 +168,35 @@ Layers:
    R is a **guard**: once chosen it is persisted and reused for 30 days unless
    unreachable. This limits how often a client is exposed to a fresh, possibly
    malicious, entry.
-2. C opens a libp2p stream `/dvpn/splice/1` to R, containing `SpliceRequest { exit: PeerId }`.
-3. R dials E, opens `/dvpn/exit/1`, and pipes bytes in both directions without
-   interpreting them. R forwards nothing about C.
+2. C opens a libp2p stream `/dvpn/splice/2` to R, containing
+   `SpliceRequest { exit, addrs, datagrams }`.
+3. R dials E, opens `/dvpn/exit/2`, sends E a `RelayHello` with E's half of the
+   datagram offer (§3.4a), answers C with its half, and then pipes bytes in both
+   directions without interpreting them. R forwards nothing about C.
 4. Through that pipe, C runs a **Noise_NK_25519_ChaChaPoly_BLAKE2s** handshake (`snow`)
    against E's static key from the signed ExitRecord.
    - NK means C has no static key, so E cannot identify or link the client.
    - Ephemeral keys provide forward secrecy.
-5. E answers with an `ExitHello { assigned_ip: 10.77.x.y, mtu }` inside the Noise session.
-6. Data phase: IP packets are carried as Noise transport messages. Each message is:
+   - The prologue is `dvpn-circuit-v2` followed by E's peer ID, so the handshake is
+     bound to the exit C meant to reach, not only to its key.
+   - The first message carries only the protocol version: it is protected by the
+     exit's static key alone (not forward-secret) and can be replayed, so nothing
+     sensitive may ever go in it (a unit test enforces that it is one byte).
+   - E tries its current key, then the one it replaced (§3.1).
+5. E answers with an `ExitHello { assigned_ip: 10.77.x.y, mtu, datagram_keys }` inside
+   the Noise session. That message is encrypted with keys from both ephemeral keys, so
+   the datagram keys (§3.4a) are forward secret like the session's.
+6. Data phase on the stream: IP packets are carried as Noise transport messages, until
+   the datagram path works (§3.4a). Each message is:
    - length-prefixed,
-   - padded to size buckets (256 / 512 / 1024 / 1500 bytes) to reduce size
-     fingerprinting,
+   - padded to size buckets (256 / 512 / 1024 / 1362 bytes) to reduce size
+     fingerprinting; the MTU is 1360,
    - AEAD-protected, so tampered, replayed or reordered messages are rejected and the
      session is torn down.
+   - **Rekeying.** Each direction switches to a new key every 16384 messages (both
+     sides count the same messages), so a key read later from an endpoint's memory
+     decrypts only a window of a long session.
+   - Length prefix and ciphertext go out in one write.
 7. Keepalive: an empty packet, which padding makes indistinguishable from any small
    packet.
    - C sends one after 10 s without sending or receiving anything. It checks every
@@ -154,7 +210,51 @@ Layers:
      IP address.
 
 This composes standard, audited building blocks (libp2p Noise, the Noise Framework via
-`snow`). **No custom cryptographic primitives or handshakes are written.**
+`snow`, ChaCha20-Poly1305 and BLAKE2s from RustCrypto). **No custom cryptographic
+primitives or handshakes are written.** The datagram layer (§3.4a) is our own
+composition of those primitives, modelled on WireGuard's data packets; it has not been
+reviewed externally.
+
+### 3.4a Datagram path
+A stream delivers everything in order, so one lost packet holds back every packet
+after it, and TCP connections inside the tunnel retransmit on top of the stream's own
+retransmissions ("TCP over TCP"): stalls and collapsing throughput on lossy links,
+and delay for calls and games. So packets go as UDP datagrams when they can
+(`src/datagram.rs`), next to the circuit's stream.
+
+- **Topology.** Every node has one UDP socket (port 4002, `--datagram-port`; any free
+  port if taken; `--no-datagrams` turns it off). C and E send datagrams only to R, at
+  the IP of their libp2p connection to it. R is publicly reachable, so an exit behind
+  NAT needs no hole punching: its own datagrams open its NAT, and R answers to the
+  address they came from. E never learns C's address, as on the stream.
+- **Offer.** R gives each side, over the stream, its own random 64-bit circuit ID and
+  32-byte hop key. The IDs and keys differ per hop.
+- **Two layers.** `[circuit id][counter][hop ciphertext]`, where the hop plaintext is
+  `[e2e counter][e2e ciphertext]` and the e2e plaintext the padded packet.
+  - Per hop (ChaCha20-Poly1305 with the hop key, the header as associated data): R
+    forwards only what authenticates, re-encrypted for the other hop, so the bytes
+    before and after R differ and an observer of both links can't match them. R learns
+    each side's address from its newest authenticated datagram only, so a replayed old
+    datagram from elsewhere can't redirect the circuit, and R never sends to an address
+    that didn't prove the key: no reflection or amplification.
+  - End to end (ChaCha20-Poly1305 with keys E sent in `ExitHello`): R can't read or
+    alter packets.
+  - Each layer rejects replays with a 1024-packet sliding window, so reordering is
+    tolerated and duplicates aren't.
+  - The e2e keys move forward every 16384 packets (`k' = BLAKE2s(k ‖ "dvpn ratchet")`;
+    the epoch follows from the counter), and earlier keys are forgotten: the same
+    forward secrecy within a session as on the stream. A receiver keeps the previous
+    epoch's key for stragglers and catches up at most 4 epochs at a time.
+- **Switching.** Packets go over the stream until a valid datagram arrives from the
+  other end, then as datagrams. Both ends probe with keepalives (every 0.5 s for 10 s,
+  then every 5 s) while no datagrams arrive. After 20 s without one, packets go over
+  the stream again and probing resumes. Keepalives after 10 s of datagram silence go
+  over the stream as well, so a path that dies mid-session can't make the client give
+  up the circuit before packets have switched back.
+- **Limits.** R rate-limits forwarded datagrams per circuit and direction like
+  splices, dropping what exceeds the rate. The relayed circuit ends with the splice.
+- **Sizes.** A full packet (1362 padded + 56 bytes of headers and tags + 28 for IP and
+  UDP) is 1446 bytes, so it fits DS-Lite (1460) and PPPoE (1492) links unfragmented.
 
 ### 3.5 Client tunnel (`dvpn connect`)
 - `connect` always lends as well (§3.9): no circuit is built until this machine's own
@@ -170,30 +270,51 @@ This composes standard, audited building blocks (libp2p Noise, the Noise Framewo
     When reconnecting, each candidate relay is exempted the same way.
 - DNS: `--dns` (default 9.9.9.9) is set as the only resolver for `dvpn0` via
   systemd-resolved (`resolvectl`, routing domain `~.`), so queries go through the
-  tunnel. The exit can see them. `--dns none` leaves DNS alone.
-  - That only works if `/etc/resolv.conf` points at resolved's stub (`127.0.0.53`).
-    Otherwise queries go to the local resolver, outside the tunnel, so the client
-    warns in the log, the TUI and `dvpn status`.
-- IPv4 only in MVP; IPv6 is blackholed while connected. If the blackhole can't be
-  installed and the host has an IPv6 default route, connecting is refused (fail
-  closed).
-- **Inbound firewall** (`ip dvpn-client`, installed with the routes; failure to install
-  refuses the connection): on `dvpn0`, only `established,related` is accepted. The
-  exit is untrusted and could otherwise open connections to services listening on
-  the client.
-- **Kill switch.**
-  - Protection starts when the routes are installed, after the first circuit.
-    Before that, traffic goes out normally. `protected` in `dvpn status` and
-    "Not protected yet" in the TUI say so. The routes can't go in earlier, because
-    the client's first DHT discovery needs direct connectivity.
-  - From then on, if the circuit drops, routes remain and packets are dropped until a
-    new circuit is built.
-- **Teardown.** Everything is reverted when `connect` or the TUI stops, on SIGINT,
-  SIGTERM or SIGHUP (closing the terminal). The signal handlers are installed before
-  any system change.
-  - After SIGKILL or a crash, the next start removes the leftovers, unless another
-    dvpn runs in the same network namespace.
-  - The original `ip_forward` is kept in `/run/dvpn-ip-forward-<netns>` so it can be
+  tunnel. `--dns none` leaves DNS alone.
+  - **Encrypted** with DNS-over-TLS (`--dns-over-tls yes`, the default), so the exit
+    can't read the queries. Well-known resolvers (Quad9, Cloudflare, Google) are set
+    with their TLS name, so resolved checks the certificate. `opportunistic` falls
+    back to plain DNS (an exit can force that); `no` turns it off. If resolved can't
+    do it, the client warns.
+  - **Stray DNS is redirected** (table `ip dvpn-dns`, while a client runs): any query
+    on port 53 that would leave outside `dvpn0` (to a resolver on the LAN, because
+    `/etc/resolv.conf` doesn't point at resolved's stub, a local forwarder such as
+    dnsmasq, or resolved's queries over other links) is DNATed to the tunnel's DNS
+    server, and DNS-over-TLS (853) outside the tunnel is refused. Names on a LAN-only
+    resolver (e.g. `nas.lan`) therefore don't resolve while connected. Only resolved
+    encrypts, so without its stub DNS goes through the tunnel in plain text and the
+    app warns that the exit can read it.
+- IPv4 only in MVP; IPv6 is refused and blackholed while connected.
+- **Kill switch** (`src/platform/linux/tunnel.rs`, tables `ip dvpn-client` and `ip6 dvpn-client`).
+  Installed when the user connects, before anything else, and removed only when they
+  disconnect; failing to install it refuses the connection.
+  - **Outgoing:** a packet may leave only through `dvpn0`, `lo` or `dvpn-exit`, to the
+    LAN (private ranges, link-local, multicast, and attached networks of at least a
+    /16), as dvpn's own traffic (its cgroup v2, e.g. `system.slice/dvpn.service`), as
+    a reply to a connection a peer started, or as an ICMP error. Everything else is
+    rejected. Because this filters by interface, not by route, routes pushed by a
+    rogue DHCP server or router advertisement can't steer traffic around the tunnel.
+    IPv6 may only reach link-local, multicast and ULA addresses.
+  - **Incoming:** on `dvpn0`, only `established,related` is accepted. The exit is
+    untrusted and could otherwise open connections to services listening on the
+    client.
+  - **From the first click.** dvpn's own traffic is exempt, so the first DHT discovery
+    works while everything else is already blocked: there is no unprotected phase
+    before the first circuit.
+  - **Failures block, never leak.** If the circuit drops, the client fails, the node
+    stops or the network changes, the kill switch stays and the service brings the
+    connection back (§3.12).
+  - Without cgroup v2 (or if nftables refuses the rule), only the inbound part is
+    installed and protection relies on routes; the app says "Not fully protected".
+- **Teardown.** Everything is reverted on disconnect, and when `connect` stops on
+  SIGINT, SIGTERM or SIGHUP. The signal handlers are installed before any system
+  change.
+  - After SIGKILL or a crash of the service while connected, the kill switch stays and
+    the restarted service reconnects. Otherwise the next start removes leftovers
+    (including IPv6 blackholes), unless another dvpn runs in the same network
+    namespace. Removing the package removes them too.
+  - The original `ip_forward` is kept in `dvpn-ip-forward-<netns>` (in
+    `/run/dvpn-state/` for the service, `/run/` for the commands) so it can be
     restored then.
 
 ### 3.6 Exit (`dvpn run --exit`, and part of every `dvpn connect`)
@@ -205,33 +326,67 @@ This composes standard, audited building blocks (libp2p Noise, the Noise Framewo
   - it claims only what the exit policy and logging actually do.
 - TUN `dvpn-exit` at `10.77.0.1/16`, IPv4 forwarding, nftables masquerade from
   `10.77.0.0/16` to the WAN interface (`--wan`, default: the default route's device).
-  - Set up by the binary when lending starts and removed when it stops (`src/lend.rs`),
+  - Set up by the binary when lending starts and removed when it stops
+    (`src/platform/linux/exit.rs`),
     in the same way routes are. It refuses to start if a `dvpn` table already
     exists.
   - After a crash or `kill -9`, `scripts/exit-teardown.sh` removes the leftovers.
     `scripts/exit-setup.sh` remains for operators who want to inspect or apply the
     rules by hand.
 - **Exit policy**, enforced in userspace before a packet is written to the TUN:
-  - deny RFC1918, loopback, link-local, CGNAT, multicast, reserved ranges, and every
-    network the exit host is attached to, including its own addresses. This keeps
-    clients away from the operator's LAN and from services on the exit host.
-  - deny TCP 25 (SMTP), and non-first TCP fragments (their port can't be checked),
+  - deny every IANA special-purpose range (`addrs::SPECIAL_PURPOSE_V4`, shared with the
+    firewall), and every network the exit host is attached to, including its own
+    addresses. This keeps clients away from the operator's LAN and from services on
+    the exit host.
+  - deny the exit's own **public** addresses as peers see them (identify's observed
+    address, AutoNAT's confirmed ones; the 16 most recent). Behind a home router
+    that's the router's WAN address, which isn't on any interface of the host:
+    without this, a client could reach port forwards into the LAN, or the router,
+    through hairpin NAT.
+  - **ports** (`policy::Ports`), by exit kind:
+    - dedicated exits forward every port except TCP 25 (SMTP);
+    - users' exits forward only common services, a "reduced exit policy" like Tor's
+      (`REDUCED_TCP_PORTS`, `REDUCED_UDP_PORTS`): the web (80, 443, 8080, …, QUIC),
+      DNS, NTP, mail retrieval and submission (not 25), SSH, XMPP, IRC over TLS, git,
+      OpenVPN, STUN for calls, Mumble, and ICMP. Other ports and protocols are refused.
+      Lenders accepted lending, not answering for arbitrary traffic, and these exits
+      are only used when no dedicated exit fits;
+  - non-first fragments whose port can't be checked,
   - extra networks via `--exit-deny <cidr>`,
   - anti-spoofing: a packet's source IP must equal the circuit's assigned IP, otherwise
     it is dropped.
 - Limits: max sessions (`--exit-max-sessions`) and bandwidth per session and direction
   (`--exit-rate-mbps`).
+- **Return path** (`src/exit.rs`): a dedicated exit's TUN device has one queue per core
+  (up to 4, Linux multi-queue TUN), each read by its own task; the kernel spreads
+  packets over them by flow. Sessions are spread over the queues for writing. The
+  table of which session owns which address is a read-write lock, read once per
+  packet. Users' exits use one queue.
+- **Exit notice** (`src/notice.rs`, dedicated exits with `--exit-notice`): a static page
+  on port 80 of the exit's address (`--exit-notice-listen`) for whoever looks up an
+  address they saw traffic from. It explains that the traffic came from dvpn users the
+  exit can't identify and that it keeps no logs, plus an optional `--exit-contact`.
+  Every request gets the same page; at most 32 connections are served at once and
+  only the request head is read. Users' exits don't offer it: it would announce to
+  anyone scanning that a home connection is a VPN exit.
   - Defaults are 64 sessions at 20 Mbit/s for `run --exit`.
   - Defaults are 16 sessions at 10 Mbit/s for `connect`, to protect the user's own
     connection.
-- **Sessions per relay** are capped at max/4 (minimum 2). Exits can't identify clients,
-  but this stops a single relay, and so a single client, from taking every slot.
+- **Sessions per relay** are capped at max/2 (minimum 2). Exits can't identify clients,
+  but this stops a single relay, and so a single client, from taking every slot. Not
+  tighter, because entry relays are the few dedicated servers.
+- The exit's handshake times out after 5 s, so a stalled handshake holds a slot only
+  briefly. Relays run at most 8 splices per requesting peer, and every node caps
+  connections (64 pending and 512 established incoming, 8 per peer).
 - The nftables table repeats the essential rules as a second layer, and adds one:
   nothing may start a connection *towards* clients through `dvpn-exit` (only
   `established,related`).
   - forward only to the WAN interface,
-  - no private destinations or SMTP,
-  - drop all input from the TUN to the host.
+  - no special-purpose destinations, none of the exit's own public addresses (set
+    `self_deny`), the same port policy (`Ports::nft_rules`),
+  - drop all input from the TUN to the host,
+  - if IPv4 forwarding was off before lending, forward nothing but lent traffic: the
+    host doesn't become a router for its LAN neighbours.
 
 ### 3.7 Relay
 - Enabled by default with caps: 64 concurrent splices, and 20 Mbit/s per splice and
@@ -246,8 +401,14 @@ This composes standard, audited building blocks (libp2p Noise, the Noise Framewo
     `$XDG_RUNTIME_DIR/dvpn-<hash>.sock` instead.
   - It never uses a world-writable directory such as `/tmp`.
   - Only one node per data directory can run at a time.
-- Default logging is `info` with no peer IPs, destinations or packet data. `--debug`
-  enables more detail, but those fields are still redacted.
+- Default logging is `info` with no peer IPs, destinations or packet data, and no
+  remote peer IDs (those only with `--debug`). `--debug` enables more detail, but
+  addresses are still redacted.
+  - The service writes only warnings to the journal, which is kept on disk: info
+    lines tell when the VPN was used, which shouldn't outlive the session. The app
+    shows the recent info lines from memory.
+  - Errors from `ip`/`nft` have every IP address replaced with `<ip>`, since their
+    arguments hold relay addresses.
   - libp2p error messages embed peer addresses. Every one we turn into text (dial
     errors, stream errors, listen errors, relay circuit addresses) goes through
     `addrs::redact` first, because it can reach logs, the TUI and `dvpn status`.
@@ -283,6 +444,10 @@ exit too, and there is no way to connect without one.
   Each gets `lookup main suppress_prefixlength 1` (pref 7700), so LAN and host routes
   still apply, then `lookup 7700` (pref 7701). The client's `/1` routes therefore never
   capture lent traffic, even while its own tunnel is blocked.
+- **Network changes.** The firewall, the deny list and the bypass table are built for
+  the network lending started on. Lending checks the default route and the host's
+  networks every 10 s; on a change it reports itself down (no longer ready) and the
+  service restarts lending, and the VPN if it was on, for the new network.
 - **Address collisions.** Every exit hands out addresses from `10.77.0.0/16`, so a
   remote exit could assign us an address our own exit has leased.
   - Leases start at a random point.
@@ -334,14 +499,30 @@ exit too, and there is no way to connect without one.
   two can't drift apart.
 
 ### 3.12 Service and desktop app (`dvpn daemon`, `dvpn-gui`)
-The desktop app is the unprivileged client of a root service, so no user interface
-runs as root.
+The desktop app is the unprivileged client of a service that isn't root either.
 
 - **Service.** `dvpn daemon` runs under systemd (`packaging/dvpn.service`), with its
   data in `/var/lib/dvpn`.
+  - **Its own user, not root.** It runs as the system user `dvpn` (`dvpn.sysusers`)
+    with `CAP_NET_ADMIN` as its only capability (bounding and ambient set), which
+    `ip`, `nft` and `resolvectl` inherit. That covers TUN devices, routes, nftables
+    and `ip_forward` (a network sysctl). Two things need polkit: asking whether the
+    app's process may control the service (the action `dev.dvpn.control` names user
+    `dvpn` as its owner), and setting DNS on the tunnel device through
+    systemd-resolved (`/usr/share/polkit-1/rules.d/60-dvpn.rules` allows this user
+    exactly `set-dns-servers`, `set-domains`, `set-dns-over-tls` and `revert`). The
+    ip_forward backup lives in its runtime directory `/run/dvpn-state` (kept across
+    restarts, so a crashed run's value is restored). On upgrade systemd hands the
+    existing `/var/lib/dvpn` to the new user.
   - It starts at boot (and on demand through `dvpn.socket`), **idle**: no node, no
     lending, nothing on the network until a client asks it to lend or connect.
   - It owns one `Controller` and handles requests one at a time, so actions never race.
+  - **What the user asked for is kept.** From connect until disconnect it holds the
+    kill switch (§3.5). If the client fails, it is restarted after 5 s; if the node
+    stops, lending (and the VPN) restart after 5 s; on a network change, at once.
+    Traffic stays blocked meanwhile.
+  - **After a crash while connected** the kill switch is still there; the restarted
+    service finds it and reconnects instead of unblocking traffic.
   - **Lending on its own.** `Action::Lend` (the app's "Start lending") starts lending
     without connecting the VPN, for users who want
     to volunteer their connection. Exits only exist while someone lends, so this keeps
@@ -364,16 +545,32 @@ runs as root.
   - SIGTERM disconnects, stops lending, restores routes, DNS and the firewall, then
     exits.
   - At startup it removes firewall and routing rules a crashed predecessor left
-    behind (`lend::recover_stale_state`), unless another root `dvpn` is running.
-- **Control socket.** `/run/dvpn/control.sock`, created by systemd as `root:dvpn`, mode
-  0660. Being in the `dvpn` group is what grants control of the VPN.
+    behind (`platform::exit::recover_stale_state`), unless another root `dvpn` is running.
+- **Control socket.** `/run/dvpn/control.sock`, mode 0666: anyone may connect, and the
+  service decides per connection (peer credentials) whom it answers
+  (`platform::service::Access`):
+  - root, and the service's own user;
+  - members of the `dvpn` group, read from `/etc/group` and `/etc/passwd` when
+    connecting, so adding someone works at once, without logging out;
+  - whoever polkit allows the action `dev.dvpn.control`
+    (`/usr/share/polkit-1/actions/dev.dvpn.policy`): by default anyone signed in at
+    this computer (active local session), without a password, like NetworkManager's
+    VPN control. Answers are reused for 5 minutes per process.
+  - Others get `Denied` with instructions for every request.
   - The protocol is one JSON request per line, each answered by one JSON line
     (`control::Request` and `Response`).
+  - `{"cmd":"watch","logs":true}` turns a connection into a feed instead: the
+    service pushes an `Update` when its state changes (the whole `View` without its
+    logs) and when log lines are written (only the new ones; the first update has the
+    last 200). While anyone watches, the service builds the `View` once per second
+    and sends it only if it changed; otherwise it builds none.
   - Requests can only choose among fixed `Action`s: accept the terms, lend, lend at
-    boot on/off, connect, disconnect, turn off, set the selection, measure, add a bootstrap peer. No paths,
+    boot on/off, connect, disconnect, turn off, set the selection, measure, add or
+    remove a bootstrap peer. No paths,
     commands or system settings pass through.
   - A bootstrap address must parse as a multiaddr ending in `/p2p/<id>`. It is written
-    only to the service's own `config.json`.
+    only to the service's own `config.json`, and a running node contacts it at once.
+    The `View` lists the saved ones, so the app can show and remove them.
   - Request lines over 64 KiB close the connection. Each connection has its own task,
     so one slow client can't block the others.
   - The service's settings (DNS, rate limits, listen addresses) come from
@@ -383,14 +580,19 @@ runs as root.
 - **Packages** (`cargo deb`, `cargo deb -p dvpn-gui`):
   - `dvpn` holds the binary (in `/usr/libexec/dvpn/`, not on PATH), the units, the
     sysusers entry for the `dvpn` group and `/etc/default/dvpn`. Installing it adds the installing user (from `SUDO_USER` or
-    `PKEXEC_UID`) to the group. Purging it deletes `/var/lib/dvpn`, including the
-    identity keys.
+    `PKEXEC_UID`) to the group, and the polkit action that lets whoever is signed in use
+    the app; nothing needs setting up and nobody needs to log out. Purging it deletes
+    `/var/lib/dvpn`, including the identity keys.
   - `dvpn-gui` holds the Tauri app, its menu entry and an autostart entry.
-- **Desktop app** (`gui/`, Tauri 2): a tray icon and a window, both reading the
-  service's `View`.
+- **Desktop app** (`gui/`, Tauri 2): a tray icon and a window, both showing the
+  service's `View`. One watch connection feeds both (the window through the Tauri
+  event `update`); nothing polls. Actions use connections of their own.
   - Closing the window keeps the tray icon. Quitting the app leaves the VPN running,
     and the menu says so.
   - At login, `--hidden` exits quietly if this account can't use the service.
+  - Only one instance runs; starting it again shows the window.
+  - Desktop notifications say when the VPN is up, and when a failure blocks traffic.
+  - The consent screen asks separately whether to lend at every start.
   - The frontend is static HTML, CSS and JS, with no npm build step. The webview's
     CSP allows only the app's own files.
 
@@ -402,20 +604,36 @@ runs as root.
 - rust-libp2p is mature (Kademlia, DCUtR, AutoNAT, Relay v2, Noise, QUIC).
 - `snow` is a well-established Noise implementation.
 
-Single crate, one binary `dvpn`:
+One binary `dvpn` (plus the desktop app in `gui/`). Everything that depends on the
+operating system is in `src/platform/`; the rest is shared by every platform:
 
 ```
 src/
   main.rs        the service (daemon) and operator commands (init | run | connect | status)
-  identity.rs    key generation, storage, permission checks
-  records.rs     signed ExitRecord / relay records
-  node.rs        libp2p swarm + behaviour composition
-  discovery.rs   kad, mdns, bootstrap, peer cache
+  identity.rs    keys: stable for servers, new every session for users
+  records.rs     signed ExitRecord / relay records, provider shards
+  node.rs        libp2p swarm: kad, mdns, relay, AutoNAT, DCUtR, publishing, circuits
   circuit.rs     splice protocol + Noise_NK client/exit sessions
   framing.rs     length-prefix + padding buckets
-  tunnel.rs      client TUN + routing + kill switch
-  exit.rs        exit TUN, policy, IP assignment, anti-spoofing
-  control.rs     Unix-socket status API
+  client.rs      the VPN client: circuit, TUN, reconnects
+  select.rs      exit selection (random, max ping), guards
+  exit.rs        exit forwarding, rate limits
+  policy.rs      exit policy: destinations, ports, anti-spoofing
+  lend.rs        lending: exit TUN, readiness, network changes
+  controller.rs  the service's state machine (what the app sees and does)
+  control.rs     the control protocol (JSON lines)
+  daemon.rs      the service loop
+  dns.rs         DNS-over-TLS settings
+  notice.rs      the exit notice page (dedicated exits)
+  platform/      the OS-specific parts behind one interface (see platform/mod.rs):
+    linux/tunnel.rs   capture routes, DNS pinning, kill switch (iproute2, resolved, nftables)
+    linux/exit.rs     forwarding, NAT, exit firewall, policy routing
+    linux/net.rs      default route, attached networks (read over netlink, linux/netlink.rs)
+    linux/ipc.rs      Unix control socket, peer credentials
+    linux/service.rs  systemd socket activation, signals, access (polkit, /etc/group)
+    linux/files.rs    owner-only files
+    linux/cmd.rs      running ip/nft/resolvectl (changes to routes, firewall and DNS
+                      only, a few per connection; without blocking the async runtime)
 tests/           multi-node integration tests
 scripts/         exit-setup.sh / exit-teardown.sh / netns-test.sh (root harness) /
                  netns-lib.sh (shared namespace helpers)
@@ -426,11 +644,14 @@ scripts/         exit-setup.sh / exit-teardown.sh / netns-test.sh (root harness)
 | Crate | Version | Purpose |
 |---|---|---|
 | `libp2p` | 0.57.1 | features: `tokio, tcp, quic, noise, yamux, kad, mdns, identify, autonat, dcutr, relay, ping, macros, ed25519, serde` |
-| `libp2p-stream` | 0.5.0-alpha | raw byte streams for `/dvpn/splice/1` and `/dvpn/exit/1` (compatible with libp2p-swarm 0.48; **alpha**, see note) |
+| `libp2p-stream` | 0.5.0-alpha | raw byte streams for `/dvpn/splice/2` and `/dvpn/exit/2` (compatible with libp2p-swarm 0.48; **alpha**, see note) |
 | `snow` | 0.10.0 | Noise_NK end-to-end session client⇄exit |
+| `chacha20poly1305` | 0.10.1 | the datagram path's AEAD (already used inside `snow`) |
+| `blake2` | 0.10.6 | the datagram path's key ratchet (already used inside `snow`) |
 | `tokio` | 1.54.1 | async runtime (`full`) |
 | `futures` | 0.3.34 | stream utilities |
-| `tun-rs` | 2.8.16 | TUN device (`async` feature) |
+| `tun-rs` | 2.8.16 | TUN device (`async` feature), multi-queue on dedicated exits |
+| `netlink-packet-route`, `netlink-packet-core`, `netlink-sys` | 0.28.0, 0.8.2, 0.8.8 | reading routes and addresses from the kernel (Linux; the versions libp2p already uses) |
 | `ipnet` | 2.12.2 | CIDR handling for exit policy / IP pool |
 | `serde` | 1.0.229 | (`derive`) record & config serialization |
 | `postcard` | 1.1.3 | compact binary wire encoding for records/control messages |

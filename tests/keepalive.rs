@@ -15,7 +15,7 @@ use dvpn::circuit::{EXIT_IDLE_TIMEOUT, ExitSession, KEEPALIVE_TIMEOUT, Tunnel, c
 use dvpn::client::pump;
 use dvpn::device::PacketDevice;
 use dvpn::exit::{self, ExitOptions};
-use dvpn::policy::ExitPolicy;
+use dvpn::policy::{ExitPolicy, Ports};
 use libp2p::PeerId;
 use tokio::io::{DuplexStream, ReadBuf};
 use tokio::sync::mpsc;
@@ -63,10 +63,11 @@ async fn tunnel_pair() -> (Tunnel, Tunnel) {
     let params = dvpn::identity::NOISE_PARAMS.parse().unwrap();
     let keys = snow::Builder::new(params).generate_keypair().unwrap();
     let public: [u8; 32] = keys.public.as_slice().try_into().unwrap();
+    let exit_id = libp2p::PeerId::random();
     let (client_end, exit_end) = tokio::io::duplex(64 * 1024);
     let (client, exit) = tokio::join!(
-        client_handshake(Compat(client_end), &public),
-        exit_handshake(Compat(exit_end), &keys.private, Ipv4Addr::new(10, 77, 0, 2), None),
+        client_handshake(Compat(client_end), &exit_id, &public),
+        exit_handshake(Compat(exit_end), &exit_id, std::slice::from_ref(&keys.private), Ipv4Addr::new(10, 77, 0, 2), None),
     );
     (client.unwrap(), exit.unwrap())
 }
@@ -83,7 +84,7 @@ async fn serve(exit: Tunnel) -> (Arc<AtomicUsize>, mpsc::Sender<ExitSession>) {
         .await
         .unwrap();
     let options = Arc::new(ExitOptions {
-        policy: ExitPolicy::new(std::iter::empty(), vec![25]),
+        policy: ExitPolicy::new(std::iter::empty(), Ports::AllExcept(vec![25])),
         rate_mbps: 0,
     });
     tokio::spawn(exit::forward(Arc::new(IdleDevice), sessions, options, active.clone()));
@@ -130,4 +131,62 @@ async fn exit_drops_a_client_that_goes_silent() {
     assert_eq!(active.load(Ordering::Relaxed), 1, "session dropped too early");
     sleep(Duration::from_secs(2)).await;
     assert_eq!(active.load(Ordering::Relaxed), 0, "silent session still holds a slot");
+}
+
+/// One queue of a multi-queue TUN device, fed by the test.
+struct Queue(tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>);
+
+impl PacketDevice for Queue {
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let packet = self.0.lock().await.recv().await.ok_or_else(|| io::Error::other("closed"))?;
+        buf[..packet.len()].copy_from_slice(&packet);
+        Ok(packet.len())
+    }
+    async fn send(&self, packet: &[u8]) -> io::Result<usize> {
+        Ok(packet.len())
+    }
+}
+
+/// An IPv4/UDP packet from 93.184.216.34 to `dst`.
+fn udp_to(dst: Ipv4Addr) -> Vec<u8> {
+    let mut p = vec![0u8; 28];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&28u16.to_be_bytes());
+    p[8] = 64;
+    p[9] = 17;
+    p[12..16].copy_from_slice(&[93, 184, 216, 34]);
+    p[16..20].copy_from_slice(&dst.octets());
+    p[20..22].copy_from_slice(&443u16.to_be_bytes());
+    p[22..24].copy_from_slice(&40000u16.to_be_bytes());
+    p[24..26].copy_from_slice(&8u16.to_be_bytes());
+    p
+}
+
+/// Return traffic reaches its session whichever queue the kernel put it on.
+#[tokio::test]
+async fn return_traffic_from_every_queue_reaches_its_session() {
+    let (mut client, exit) = tunnel_pair().await;
+    let (inject, queues): (Vec<_>, Vec<_>) = (0..3)
+        .map(|_| {
+            let (tx, rx) = mpsc::channel(4);
+            (tx, Arc::new(Queue(tokio::sync::Mutex::new(rx))))
+        })
+        .unzip();
+    let (sessions_tx, sessions) = mpsc::channel(1);
+    sessions_tx.send(ExitSession { via_peer: PeerId::random(), tunnel: exit }).await.unwrap();
+    let options = Arc::new(ExitOptions {
+        policy: ExitPolicy::new(std::iter::empty(), Ports::AllExcept(vec![25])),
+        rate_mbps: 0,
+    });
+    let active = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(exit::forward_queues(queues, sessions, options, active.clone()));
+    while active.load(Ordering::Relaxed) == 0 {
+        tokio::task::yield_now().await;
+    }
+    for queue in &inject {
+        let packet = udp_to(client.assigned_ip);
+        queue.send(packet.clone()).await.unwrap();
+        let received = timeout(Duration::from_secs(5), client.rx.recv()).await.unwrap().unwrap().unwrap();
+        assert_eq!(received, packet);
+    }
 }

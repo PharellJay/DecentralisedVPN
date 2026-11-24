@@ -9,7 +9,7 @@ use std::time::Duration;
 use dvpn::circuit::ExitSession;
 use dvpn::device::PacketDevice;
 use dvpn::exit::{self, ExitOptions};
-use dvpn::policy::ExitPolicy;
+use dvpn::policy::{ExitPolicy, Ports};
 use dvpn::identity::Identity;
 use dvpn::node::{self, ExitConfig, NodeConfig, NodeHandle, Reachability};
 use dvpn::records::ExitKind;
@@ -28,6 +28,8 @@ pub struct Opts {
     pub exit_kind: ExitKind,
     /// Listen on 127.0.0.1; `false` simulates a node behind NAT (outbound only).
     pub listen: bool,
+    /// Has a datagram socket (on any free port).
+    pub datagrams: bool,
 }
 
 impl Default for Opts {
@@ -39,6 +41,7 @@ impl Default for Opts {
             exit: false,
             exit_kind: ExitKind::Dedicated,
             listen: true,
+            datagrams: true,
         }
     }
 }
@@ -84,6 +87,7 @@ pub async fn start_in(tmp: &Path, opts: Opts) -> TestNode {
                 blocked_tcp_ports: vec![25],
             }),
             allow_private_addrs: true,
+            datagram_port: opts.datagrams.then_some(0),
         },
     )
     .unwrap();
@@ -109,6 +113,17 @@ pub async fn start_in(tmp: &Path, opts: Opts) -> TestNode {
     }
 }
 
+/// The next packet that isn't a keepalive (datagram probes are keepalives).
+pub async fn next_packet(tunnel: &mut dvpn::circuit::Tunnel) -> Vec<u8> {
+    loop {
+        match tunnel.rx.recv().await.unwrap() {
+            Some(packet) if packet.is_empty() => {}
+            Some(packet) => return packet,
+            None => panic!("tunnel closed"),
+        }
+    }
+}
+
 /// A packet device with no traffic.
 pub struct IdleDevice;
 
@@ -125,7 +140,7 @@ impl PacketDevice for IdleDevice {
 /// sessions behave like a real exit's (e.g. keepalives are answered).
 pub fn run_exit_forwarder(node: &mut TestNode) {
     let options = Arc::new(ExitOptions {
-        policy: ExitPolicy::new(std::iter::empty(), vec![25]),
+        policy: ExitPolicy::new(std::iter::empty(), Ports::AllExcept(vec![25])),
         rate_mbps: 0,
     });
     let sessions = node.exit_sessions.take().expect("not an exit");

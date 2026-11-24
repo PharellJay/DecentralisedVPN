@@ -2,18 +2,25 @@
 
 mod common;
 
-use common::{Opts, TestNode, start, wait_for};
+use std::time::Duration;
+
+use common::{Opts, TestNode, next_packet, start, wait_for};
 use dvpn::circuit::CircuitError;
-use dvpn::identity::Identity;
 use dvpn::records::{ExitKind, ExitRecord, now_secs};
 
 /// Bootstrap node + one relay + one exit + a client, all bootstrapped off `boot`.
 async fn network() -> (TestNode, TestNode, TestNode, TestNode) {
+    network_with(true).await
+}
+
+/// [`network`], with or without a datagram path at the relay.
+async fn network_with(relay_datagrams: bool) -> (TestNode, TestNode, TestNode, TestNode) {
     let boot = start(Opts::default()).await;
     let via_boot = || vec![boot.addr.clone().unwrap()];
     let relay = start(Opts {
         bootstrap: via_boot(),
         relay: true,
+        datagrams: relay_datagrams,
         ..Default::default()
     })
     .await;
@@ -62,14 +69,69 @@ async fn two_hop_circuit_carries_data_end_to_end() {
 
     let request = b"GET / HTTP/1.1 (pretend IP packet)".to_vec();
     circuit.tunnel.tx.send(&request).await.unwrap();
-    assert_eq!(session.tunnel.rx.recv().await.unwrap().unwrap(), request);
+    assert_eq!(next_packet(&mut session.tunnel).await, request);
 
     let response = b"HTTP/1.1 200 OK (pretend reply)".to_vec();
     session.tunnel.tx.send(&response).await.unwrap();
-    assert_eq!(circuit.tunnel.rx.recv().await.unwrap().unwrap(), response);
+    assert_eq!(next_packet(&mut circuit.tunnel).await, response);
 
     // The working entry relay is remembered as the guard.
     assert_eq!(dvpn::guard::load(&client.data_dir), Some(relay.handle.peer_id()));
+}
+
+/// Answers keepalives and echoes every other packet, like an exit that sends replies.
+fn echo(mut session: dvpn::circuit::ExitSession) {
+    tokio::spawn(async move {
+        while let Ok(Some(packet)) = session.tunnel.rx.recv().await {
+            if session.tunnel.tx.send(&packet).await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Sends `packet` until it comes back, then returns whether packets go as datagrams.
+async fn round_trip(tunnel: &mut dvpn::circuit::Tunnel, packet: &[u8]) -> bool {
+    tunnel.tx.send(packet).await.unwrap();
+    loop {
+        let received = tokio::time::timeout(Duration::from_secs(10), tunnel.rx.recv()).await;
+        match received.expect("an answer").unwrap() {
+            Some(answer) if answer == packet => return tunnel.uses_datagrams(),
+            Some(_) => {} // A keepalive answer.
+            None => panic!("tunnel closed"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn packets_switch_to_datagrams_once_they_get_through() {
+    let (_boot, _relay, mut exit, client) = network().await;
+    let mut circuit = wait_for("a circuit", || async { client.handle.open_circuit().await.ok() }).await;
+    echo(exit.exit_sessions.as_mut().unwrap().recv().await.unwrap());
+
+    // The first packets go over the stream; both ends probe until datagrams arrive.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut i = 0u32;
+    while !round_trip(&mut circuit.tunnel, &i.to_be_bytes()).await {
+        assert!(tokio::time::Instant::now() < deadline, "datagrams never got through");
+        i += 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for n in 0..50u32 {
+        let packet = format!("packet {n} as a datagram").into_bytes();
+        assert!(round_trip(&mut circuit.tunnel, &packet).await, "still on datagrams");
+    }
+}
+
+#[tokio::test]
+async fn packets_stay_on_the_stream_when_the_relay_has_no_datagram_path() {
+    let (_boot, _relay, mut exit, client) = network_with(false).await;
+    let mut circuit = wait_for("a circuit", || async { client.handle.open_circuit().await.ok() }).await;
+    echo(exit.exit_sessions.as_mut().unwrap().recv().await.unwrap());
+    for n in 0..20u32 {
+        assert!(!round_trip(&mut circuit.tunnel, &n.to_be_bytes()).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test]
@@ -82,11 +144,11 @@ async fn node_without_exit_refuses_exit_traffic() {
     .await;
     assert!(not_exit.exit_sessions.is_none());
 
-    // Forge the best possible target: the node's real Noise key and address.
-    let identity = Identity::load(&not_exit.data_dir).unwrap();
+    // Forge the best possible target: the node's real address (its Noise key would be
+    // any; it never has one, since it isn't an exit).
     let target = ExitRecord {
         peer_id: not_exit.handle.peer_id(),
-        noise_static: identity.exit_static.public,
+        noise_static: [7; 32],
         addrs: not_exit.handle.listen_addrs().await.unwrap(),
         blocked_tcp_ports: vec![],
         kind: ExitKind::Dedicated,
@@ -113,10 +175,9 @@ async fn node_without_relay_refuses_to_splice() {
 #[tokio::test]
 async fn relay_refuses_to_splice_back_to_the_client() {
     let (_boot, relay, _exit, client) = network().await;
-    let identity = Identity::load(&client.data_dir).unwrap();
     let loopback = ExitRecord {
         peer_id: client.handle.peer_id(),
-        noise_static: identity.exit_static.public,
+        noise_static: [7; 32],
         addrs: vec![],
         blocked_tcp_ports: vec![],
         kind: ExitKind::Dedicated,

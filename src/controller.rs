@@ -6,11 +6,16 @@
 //!
 //! Lending starts with [`Action::Lend`] (lending on its own, without the VPN) or with the
 //! first connect, and keeps running after a disconnect; [`Action::Stop`] turns both off.
+//!
+//! What the user asked for is kept until they ask otherwise: if the client fails, the
+//! node stops or this machine changes networks, the controller brings lending and the
+//! VPN back by itself. From connect until disconnect a kill switch blocks every packet
+//! that would leave outside the tunnel, so failures block traffic instead of leaking it.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use libp2p::Multiaddr;
@@ -33,6 +38,31 @@ pub const MAX_PING: Duration = Duration::from_secs(60);
 pub const DEFAULT_PING_LIMIT: Duration = Duration::from_millis(100);
 /// Log lines included in a [`View`].
 const VIEW_LOG_LINES: usize = 200;
+/// How long to wait before bringing back a client or node that stopped on its own.
+pub const RESTART_DELAY: Duration = Duration::from_secs(5);
+
+/// Something that blocks traffic outside the tunnel while it exists (the service uses
+/// [`crate::platform::tunnel::KillSwitch`]).
+pub trait Blocker: Send + Sync {
+    /// Called after this machine changed networks.
+    fn refresh_lan(&self) {}
+}
+
+impl Blocker for crate::platform::tunnel::KillSwitch {
+    fn refresh_lan(&self) {
+        crate::platform::tunnel::KillSwitch::refresh_lan(self);
+    }
+}
+
+pub struct KillSwitchGuard {
+    pub blocker: Box<dyn Blocker>,
+    /// Whether traffic outside the tunnel is blocked by a firewall, not only by routes.
+    pub filters_output: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Installs the kill switch; called when the user connects.
+pub type KillSwitchFn = Box<dyn Fn() -> anyhow::Result<KillSwitchGuard> + Send + Sync>;
 
 /// Everything that runs while lending: the node, the exit, and the state they share.
 pub struct Session {
@@ -67,8 +97,12 @@ pub enum Action {
     SetSelection { max_ping_ms: Option<u64> },
     /// Measure exits again (starts lending first if needed).
     Measure,
-    /// Remember a bootstrap peer in `config.json`; used from the next start.
+    /// Remember a bootstrap peer in `config.json`, and contact it now if running.
+    /// `addr` is a multiaddr or an invite link (all its peers are added).
     AddBootstrap { addr: String },
+    /// Forget a bootstrap peer (as listed in [`View::bootstrap`]). A running node keeps
+    /// the peers it already knows; the next start no longer contacts it.
+    RemoveBootstrap { addr: String },
     /// Whether the service starts lending when it starts (at boot). Saved in
     /// `config.json`; doesn't start or stop anything now.
     SetLendAtBoot { enabled: bool },
@@ -100,11 +134,19 @@ pub struct VpnView {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct View {
+    /// This session's node ID (new every session), or empty while stopped.
     pub peer_id: String,
     /// The lending terms were accepted; until then nothing can be started.
     pub consent_given: bool,
     /// The service starts lending when it starts (see [`Action::SetLendAtBoot`]).
     pub lend_at_boot: bool,
+    /// The bootstrap peers saved in `config.json`.
+    #[serde(default)]
+    pub bootstrap: Vec<String>,
+    /// A link others can join with (see [`config::invite_link`]): our bootstrap peers
+    /// and the relays we're connected to. `None` while we know none.
+    #[serde(default)]
+    pub invite: Option<String>,
     /// The node and the exit are running (lending is on, though maybe not ready yet).
     pub running: bool,
     /// Why lending stopped or couldn't start, if it did.
@@ -163,7 +205,6 @@ pub fn selection_action(selection: Selection) -> Action {
 
 pub struct Controller {
     data_dir: PathBuf,
-    peer_id: String,
     start: StartFn,
     session: Option<Session>,
     /// Why the last session stopped or failed to start.
@@ -180,10 +221,19 @@ pub struct Controller {
     /// Kept when switching to random, so switching back restores it.
     ping_limit: Duration,
     lend_at_boot: bool,
+    /// Lending should run: from a successful start until [`Action::Stop`].
+    want_running: bool,
+    /// The VPN should be up: from [`Action::Connect`] until a disconnect.
+    want_connected: bool,
+    kill_switch_fn: Option<KillSwitchFn>,
+    /// Present while `want_connected`.
+    kill_switch: Option<KillSwitchGuard>,
+    /// When to bring back lending or the client after they stopped on their own.
+    retry_at: Option<Instant>,
 }
 
 impl Controller {
-    pub fn new(data_dir: &Path, peer_id: String, selection: Selection, logs: LogBuffer, start: StartFn) -> Self {
+    pub fn new(data_dir: &Path, selection: Selection, logs: LogBuffer, start: StartFn) -> Self {
         let ping_limit = match selection {
             Selection::MaxPing(limit) => limit,
             Selection::Random => DEFAULT_PING_LIMIT,
@@ -193,7 +243,6 @@ impl Controller {
         Self {
             lend_at_boot,
             data_dir: data_dir.to_path_buf(),
-            peer_id,
             start,
             session: None,
             error: None,
@@ -206,7 +255,34 @@ impl Controller {
             measured_while_connected: false,
             selection,
             ping_limit,
+            want_running: false,
+            want_connected: false,
+            kill_switch_fn: None,
+            kill_switch: None,
+            retry_at: None,
         }
+    }
+
+    /// Blocks traffic outside the tunnel with `install` from connect until disconnect.
+    /// Without it (tests, no root) nothing is blocked.
+    pub fn with_kill_switch(mut self, install: KillSwitchFn) -> Self {
+        self.kill_switch_fn = Some(install);
+        self
+    }
+
+    /// After a crash while connected (the service finds the kill switch it left
+    /// behind): keep traffic blocked and connect again, as the user last asked.
+    pub fn resume_after_crash(&mut self) {
+        if !self.consent_given() {
+            return;
+        }
+        info!("dvpn stopped while connected; reconnecting, with traffic blocked until then");
+        self.want_running = true;
+        self.want_connected = true;
+        if let Err(e) = self.ensure_kill_switch() {
+            warn!("{e:#}");
+        }
+        self.retry_at = Some(Instant::now());
     }
 
     pub fn is_running(&self) -> bool {
@@ -245,7 +321,8 @@ impl Controller {
                 self.start().await?;
                 self.measure();
             }
-            Action::AddBootstrap { addr } => self.add_bootstrap(&addr)?,
+            Action::AddBootstrap { addr } => self.add_bootstrap(&addr).await?,
+            Action::RemoveBootstrap { addr } => self.remove_bootstrap(&addr)?,
             Action::SetLendAtBoot { enabled } => self.set_lend_at_boot(enabled)?,
         }
         Ok(())
@@ -264,6 +341,7 @@ impl Controller {
                 *session.state.selection.lock().expect("state lock") = self.selection;
                 self.session = Some(session);
                 self.error = None;
+                self.want_running = true;
                 Ok(())
             }
             Err(e) => {
@@ -275,11 +353,35 @@ impl Controller {
 
     async fn connect(&mut self) -> anyhow::Result<()> {
         self.start().await?;
-        if self.client.is_some() {
-            return Ok(());
+        // Fails closed: without the kill switch, don't connect at all.
+        self.ensure_kill_switch()?;
+        if !self.want_connected
+            && let Some(session) = &self.session
+        {
+            session.state.traffic.reset();
         }
-        let session = self.session.as_ref().expect("started above");
+        self.want_connected = true;
         self.client_error = None;
+        self.spawn_client();
+        Ok(())
+    }
+
+    fn ensure_kill_switch(&mut self) -> anyhow::Result<()> {
+        if self.kill_switch.is_none()
+            && let Some(install) = &self.kill_switch_fn
+        {
+            self.kill_switch = Some(install().context("installing the kill switch")?);
+        }
+        Ok(())
+    }
+
+    fn spawn_client(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if self.client.is_some() {
+            return;
+        }
         session.state.set_error(None);
         session.state.set_phase(Phase::Idle);
         self.client = Some(tokio::spawn(client::run(
@@ -287,11 +389,18 @@ impl Controller {
             session.options.clone(),
             session.state.clone(),
         )));
-        Ok(())
     }
 
-    /// Dropping the client restores routing and DNS; waits until it has.
+    /// Dropping the client restores routing and DNS; waits until it has, then lifts
+    /// the kill switch.
     async fn disconnect(&mut self) {
+        self.want_connected = false;
+        self.stop_client().await;
+        self.kill_switch = None;
+        self.client_error = None;
+    }
+
+    async fn stop_client(&mut self) {
         if let Some(task) = self.client.take() {
             task.abort();
             let _ = task.await;
@@ -302,9 +411,19 @@ impl Controller {
         }
     }
 
-    /// The VPN first (restores routes), then lending (restores the firewall), then the node.
+    /// The VPN first (restores routes and lifts the kill switch), then lending (restores
+    /// the firewall), then the node.
     pub async fn stop(&mut self) {
         self.disconnect().await;
+        self.want_running = false;
+        self.retry_at = None;
+        self.stop_session().await;
+    }
+
+    /// Stops the client, lending and the node, but not what the user asked for: the kill
+    /// switch stays, and [`Self::poll`] brings them back.
+    async fn stop_session(&mut self) {
+        self.stop_client().await;
         if let Some(task) = self.measurement.take() {
             task.abort();
         }
@@ -353,15 +472,46 @@ impl Controller {
         }));
     }
 
-    fn add_bootstrap(&self, addr: &str) -> anyhow::Result<()> {
-        let parsed: Multiaddr = addr.trim().parse().context("not a valid multiaddr")?;
-        config::split_peer_addr(&parsed)?;
+    async fn add_bootstrap(&self, text: &str) -> anyhow::Result<()> {
+        let peers = config::parse_peers(text)?;
         let mut file = FileConfig::load(&self.data_dir)?;
-        let addr = parsed.to_string();
-        if !file.bootstrap.contains(&addr) {
-            file.bootstrap.push(addr);
+        let before = file.bootstrap.len();
+        for peer in &peers {
+            let addr = peer.to_string();
+            if !file.bootstrap.contains(&addr) {
+                file.bootstrap.push(addr);
+            }
+        }
+        if file.bootstrap.len() != before {
             file.save(&self.data_dir)?;
-            info!("bootstrap peer saved; it is used from the next start");
+            info!("{} bootstrap peer(s) saved", file.bootstrap.len() - before);
+        }
+        if let Some(session) = &self.session {
+            for peer in &peers {
+                session.node.handle.add_peer(peer).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Our bootstrap peers first (chosen by hand, so likely servers), then relays.
+    fn invite(&self, bootstrap: &[String], relays: Vec<Multiaddr>) -> Option<String> {
+        let mut peers: Vec<Multiaddr> = bootstrap.iter().filter_map(|a| a.parse().ok()).collect();
+        for relay in relays {
+            if !peers.contains(&relay) && crate::addrs::is_public(&relay) {
+                peers.push(relay);
+            }
+        }
+        config::invite_link(&peers)
+    }
+
+    fn remove_bootstrap(&self, addr: &str) -> anyhow::Result<()> {
+        let mut file = FileConfig::load(&self.data_dir)?;
+        let before = file.bootstrap.len();
+        file.bootstrap.retain(|a| a != addr.trim());
+        if file.bootstrap.len() != before {
+            file.save(&self.data_dir)?;
+            info!("bootstrap peer removed");
         }
         Ok(())
     }
@@ -380,7 +530,8 @@ impl Controller {
         Ok(())
     }
 
-    /// Collects finished background work. Call regularly (the service does on every tick).
+    /// Collects finished background work, and brings back what stopped on its own. Call
+    /// regularly (the service does on every tick).
     pub async fn poll(&mut self) {
         if self.client.as_ref().is_some_and(JoinHandle::is_finished) {
             let task = self.client.take().expect("checked");
@@ -391,6 +542,11 @@ impl Controller {
             };
             if let Some(session) = &self.session {
                 session.state.set_phase(Phase::Idle);
+            }
+            if self.want_connected {
+                let error = self.client_error.as_deref().unwrap_or("it stopped");
+                warn!("the VPN client failed ({error}); traffic stays blocked, retrying in {} s", RESTART_DELAY.as_secs());
+                self.retry_at = Some(Instant::now() + RESTART_DELAY);
             }
         }
         if self.measurement.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -405,31 +561,90 @@ impl Controller {
                 Ok(Err(e)) => format!("the node stopped: {e:#}"),
                 Err(e) => format!("the node stopped: {e}"),
             };
-            warn!("{error}; lending and the VPN are off");
-            self.stop().await;
+            self.stop_session().await;
+            if self.want_running {
+                warn!("{error}; restarting in {} s", RESTART_DELAY.as_secs());
+                self.retry_at = Some(Instant::now() + RESTART_DELAY);
+            } else {
+                warn!("{error}; lending and the VPN are off");
+            }
             self.error = Some(error);
+        }
+        if self.session.as_ref().is_some_and(|s| s.lending.handle().public_ip_changed()) {
+            info!("starting a new session with a new identity, for the new public address");
+            self.stop_session().await;
+            self.retry_at = Some(Instant::now());
+        }
+        if self.session.as_ref().is_some_and(|s| s.lending.handle().network_changed()) {
+            info!("restarting lending{} for the new network", if self.want_connected { " and the VPN" } else { "" });
+            self.stop_session().await;
+            if let Some(kill_switch) = &self.kill_switch {
+                kill_switch.blocker.refresh_lan();
+            }
+            self.retry_at = Some(Instant::now());
+        }
+        self.bring_back().await;
+    }
+
+    /// Restarts lending and the client if they should run and their retry is due.
+    async fn bring_back(&mut self) {
+        if self.retry_at.is_none_or(|at| Instant::now() < at) {
+            return;
+        }
+        self.retry_at = None;
+        if self.want_running && self.session.is_none() {
+            if let Err(e) = self.start().await {
+                warn!("restarting lending failed ({e:#}); trying again in {} s", RESTART_DELAY.as_secs());
+                self.retry_at = Some(Instant::now() + RESTART_DELAY);
+                return;
+            }
+            info!("lending restarted");
+        }
+        if self.want_connected && self.client.is_none() {
+            self.spawn_client();
         }
     }
 
+    /// The log the view's lines come from.
+    pub fn logs(&self) -> LogBuffer {
+        self.logs.clone()
+    }
+
     pub async fn view(&self) -> anyhow::Result<View> {
-        let mut logs = self.logs.lines();
+        self.view_with(true).await
+    }
+
+    /// Without `logs`, the view's log lines are left out (watchers get them separately).
+    pub async fn view_with(&self, logs: bool) -> anyhow::Result<View> {
+        let mut logs = if logs { self.logs.lines() } else { Vec::new() };
         logs.drain(..logs.len().saturating_sub(VIEW_LOG_LINES));
         let availability = match (self.selection, &self.measurements) {
             (Selection::MaxPing(limit), Some(m)) => Some(select::availability(m, limit)),
             _ => None,
         };
+        let (filters_output, mut warnings) = match &self.kill_switch {
+            Some(k) => (k.filters_output, k.warnings.clone()),
+            None => (false, Vec::new()),
+        };
         let mut view = View {
-            peer_id: self.peer_id.clone(),
+            peer_id: String::new(),
             consent_given: lend::consent_given(&self.data_dir),
             lend_at_boot: self.lend_at_boot,
+            bootstrap: FileConfig::load(&self.data_dir).map(|c| c.bootstrap).unwrap_or_default(),
+            invite: None,
             running: false,
             error: self.error.clone(),
             nat: NatState::Unknown,
             routing_peers: 0,
             lending: LendingView::default(),
             vpn: VpnView {
+                running: self.want_connected,
+                // Wanted but no client yet: it's being brought back, with traffic blocked.
+                phase: if self.want_connected { Phase::Reconnecting } else { Phase::Idle },
+                protected: filters_output,
+                warnings: warnings.clone(),
                 last_error: self.client_error.clone(),
-                ..VpnView::default()
+                circuit: None,
             },
             selection: self.selection,
             ping_limit_ms: self.ping_limit.as_millis() as u64,
@@ -446,8 +661,10 @@ impl Controller {
         let state = &session.state;
         let lending = session.lending.handle();
         view.running = true;
+        view.peer_id = handle.peer_id().to_string();
         view.nat = status.nat;
         view.routing_peers = handle.routing_peers().await.context("node stopped")?.len();
+        view.invite = self.invite(&view.bootstrap, handle.relay_addrs().await.unwrap_or_default());
         view.lending = LendingView {
             ready: lending.ready(&status),
             published: status.exit_published,
@@ -458,12 +675,17 @@ impl Controller {
             rate_mbps: lending.rate_mbps,
             wan: lending.wan.clone(),
         };
+        warnings.extend(state.warnings.lock().expect("state lock").iter().cloned());
         view.vpn = VpnView {
-            running: self.client.is_some(),
-            phase: *state.phase.lock().expect("state lock"),
-            protected: state.protected.load(Ordering::Relaxed),
-            warnings: state.warnings.lock().expect("state lock").clone(),
-            circuit: state.circuit.lock().expect("state lock").clone(),
+            running: self.want_connected,
+            phase: match self.client {
+                Some(_) => *state.phase.lock().expect("state lock"),
+                None if self.want_connected => Phase::Reconnecting,
+                None => Phase::Idle,
+            },
+            protected: filters_output || state.protected.load(Ordering::Relaxed),
+            warnings,
+            circuit: state.circuit_report(),
             last_error: self.client_error.clone().or_else(|| state.last_error.lock().expect("state lock").clone()),
         };
         Ok(view)

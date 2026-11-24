@@ -1,51 +1,12 @@
-//! Thin wrappers around `ip` (iproute2) and `nft`. Route, rule and address changes need root.
+//! The host's routes and networks, read from the kernel over netlink
+//! ([`super::netlink`]); no `ip` processes.
 
-use std::io::Write;
 use std::net::Ipv4Addr;
-use std::process::{Command, Stdio};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use ipnet::Ipv4Net;
 
-pub fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
-    run_with_stdin(program, args, None)
-}
-
-/// Like [`run`], feeding `stdin` to the program (e.g. a ruleset to `nft -f -`).
-pub fn run_with_stdin(program: &str, args: &[&str], stdin: Option<&str>) -> anyhow::Result<String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("could not run {program}"))?;
-    if let Some(input) = stdin {
-        child.stdin.take().expect("piped stdin").write_all(input.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        bail!("`{program} {}` failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Completes on SIGINT, SIGTERM or SIGHUP (e.g. the terminal window closing), so every
-/// command can undo its routes and firewall rules instead of being killed mid-way.
-/// The handlers are installed when this is called, not when it's first polled.
-pub fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut hangup = signal(SignalKind::hangup())?;
-    Ok(async move {
-        tokio::select! {
-            _ = interrupt.recv() => {}
-            _ = terminate.recv() => {}
-            _ = hangup.recv() => {}
-        }
-    })
-}
+use super::netlink;
 
 /// Next hop of a route: an optional gateway and the outgoing device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +28,7 @@ impl NextHop {
 }
 
 /// Parses `... via <gw> dev <dev> ...` from one line of `ip route` output.
+#[cfg(test)]
 pub fn parse_next_hop(line: &str) -> Option<NextHop> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let after = |key: &str| tokens.windows(2).find(|w| w[0] == key).map(|w| w[1]);
@@ -76,16 +38,26 @@ pub fn parse_next_hop(line: &str) -> Option<NextHop> {
     })
 }
 
-/// The route the kernel would currently use to reach `ip`.
-pub fn route_get(ip: Ipv4Addr) -> anyhow::Result<Option<NextHop>> {
-    Ok(run("ip", &["-4", "route", "get", &ip.to_string()])?.lines().next().and_then(parse_next_hop))
+/// The next hop of `route`; `None` without an outgoing interface (e.g. unreachable).
+fn next_hop(route: Option<netlink::Route>) -> anyhow::Result<Option<NextHop>> {
+    let Some(route) = route else { return Ok(None) };
+    let Some(oif) = route.oif else { return Ok(None) };
+    let dev = netlink::interface_name(oif).context("reading interface names")?;
+    Ok(dev.map(|dev| NextHop { via: route.gateway, dev }))
 }
 
+/// The route the kernel would currently use to reach `ip`.
+pub fn route_get(ip: Ipv4Addr) -> anyhow::Result<Option<NextHop>> {
+    next_hop(netlink::route_to(ip).context("looking up a route")?)
+}
+
+/// The main table's default route (with the lowest metric, if there are several).
 pub fn default_route() -> anyhow::Result<Option<NextHop>> {
-    Ok(run("ip", &["-4", "route", "show", "default"])?.lines().next().and_then(parse_next_hop))
+    next_hop(netlink::default_route().context("reading the routing table")?)
 }
 
 /// Parses `inet a.b.c.d/nn` entries from `ip -o -4 addr show` output.
+#[cfg(test)]
 pub fn parse_ipv4_networks(output: &str) -> Vec<Ipv4Net> {
     output
         .lines()
@@ -99,8 +71,10 @@ pub fn parse_ipv4_networks(output: &str) -> Vec<Ipv4Net> {
 
 /// Every IPv4 network this host is attached to (including its own addresses).
 pub fn local_ipv4_networks() -> anyhow::Result<Vec<Ipv4Net>> {
-    Ok(parse_ipv4_networks(&run("ip", &["-o", "-4", "addr", "show"])?)
+    Ok(netlink::ipv4_addresses()
+        .context("reading this host's addresses")?
         .into_iter()
+        .filter_map(|(ip, len)| Ipv4Net::new(ip, len).ok())
         .map(|net| net.trunc())
         .collect())
 }
@@ -121,6 +95,20 @@ mod tests {
         assert_eq!(on_link.args(), ["dev", "wlan0"]);
 
         assert!(parse_next_hop("unreachable 10.0.0.1").is_none());
+    }
+
+    /// Netlink answers as `ip` does, where it's installed.
+    #[test]
+    fn routes_match_iproute2() {
+        let ip = |args: &[&str]| {
+            std::process::Command::new("ip").args(args).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        let Some(default) = ip(&["-4", "route", "show", "default"]) else { return };
+        assert_eq!(default_route().unwrap(), default.lines().next().and_then(parse_next_hop));
+        let target = Ipv4Addr::new(9, 9, 9, 9);
+        let get = ip(&["-4", "route", "get", &target.to_string()]).unwrap_or_default();
+        assert_eq!(route_get(target).unwrap(), get.lines().next().and_then(parse_next_hop));
+        assert!(local_ipv4_networks().unwrap().contains(&"127.0.0.0/8".parse().unwrap()));
     }
 
     #[test]

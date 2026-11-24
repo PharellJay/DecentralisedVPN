@@ -22,6 +22,10 @@ fn lending_handle(forwarder_alive: bool) -> LendingHandle {
         pool: IpPool::default(),
         wan: "eth0".into(),
         rate_mbps: 10,
+        self_addrs: Default::default(),
+        network_changed: Arc::new(AtomicBool::new(false)),
+        public_ip_changed: Arc::new(AtomicBool::new(false)),
+        started: std::time::Instant::now(),
     }
 }
 
@@ -29,6 +33,7 @@ fn connect_options() -> ConnectOptions {
     ConnectOptions {
         tun_name: "dvpn-test0".into(),
         dns: None,
+        dns_over_tls: dvpn::dns::DnsOverTls::No,
     }
 }
 

@@ -2,18 +2,15 @@
 //! `dvpn connect` requires it (see docs/DESIGN.md §3.9).
 //!
 //! [`Lending::start`] brings up the exit TUN device and the forwarder, then the system
-//! changes an exit needs:
-//! - IPv4 forwarding, and an nftables table that NATs the client pool out of the WAN
-//!   interface and keeps clients away from private ranges, SMTP and this host;
-//! - policy routing that sends lent traffic, and replies from the node's listen ports,
-//!   via the original default route. So when this machine is also connected, lending
-//!   never goes through its own tunnel and keeps working while that tunnel is down.
-//!
-//! Dropping [`Lending`] undoes all of it, in reverse order.
+//! changes an exit needs ([`ExitNetwork`]: forwarding, NAT, a firewall that confines
+//! clients, and routing that keeps lent traffic out of our own tunnel). Dropping
+//! [`Lending`] undoes all of it.
 
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use ipnet::Ipv4Net;
@@ -26,20 +23,19 @@ use tracing::{info, warn};
 use crate::circuit::{ExitSession, IpPool, MTU};
 use crate::device::TunDevice;
 use crate::exit::{self, EXIT_TUN_ADDR, EXIT_TUN_PREFIX, ExitOptions};
-use crate::node::{NatState, NodeStatus};
-use crate::policy::ExitPolicy;
-use crate::system;
+use crate::node::{NatState, NodeHandle, NodeStatus};
+use crate::policy::{ExitPolicy, Ports, SelfAddrs};
+use crate::platform::{self, exit::ExitNetwork, net};
 
 pub const EXIT_TUN: &str = "dvpn-exit";
-const POOL: &str = "10.77.0.0/16";
-const NFT_TABLE: &str = "dvpn";
-const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
-/// Routing table holding the original default route, for traffic that must bypass our tunnel.
-const BYPASS_TABLE: &str = "7700";
-/// Rule priorities: first the main table without its default-ish routes (so local and
-/// LAN routes still apply), then the bypass table. Both come before the main table.
-const PREF_MAIN_SUPPRESSED: &str = "7700";
-const PREF_BYPASS: &str = "7701";
+/// The exit's client address pool.
+pub const POOL: &str = "10.77.0.0/16";
+/// How often lending checks whether this machine changed networks.
+const NETWORK_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// A changed public address (see [`LendingHandle::public_ip_changed`]) restarts lending
+/// at most this often, so a router that alternates between uplinks can't keep the
+/// service restarting.
+const MIN_SESSION_AGE_FOR_ROTATION: Duration = Duration::from_secs(30 * 60);
 
 /// Shown before lending is enabled for the first time. Calm, but every sentence must
 /// stay true for the actual exit policy (docs/DESIGN.md §3.6).
@@ -52,9 +48,9 @@ dvpn lends while you're connected, or when you choose to lend. The dvpn service,
 the app uses, also lends from every start of this computer, even when you aren't
 connected. To stop that, untick \"Start lending when this computer starts\" in the app.
 
-Your exit never lets anyone reach your home network or this computer, and it blocks
-direct connections to mail servers, the usual route for spam. dvpn keeps no logs of
-what passes through.
+Your exit only carries common services (the web, email, chat, SSH and the like), so
+file sharing, sending spam and scanning don't go through it. It never lets anyone reach
+your home network or this computer. dvpn keeps no logs of what passes through.
 
 If someone misuses your connection, complaints may reach you first, because it's your
 IP address. Some internet providers' terms don't allow sharing your connection.";
@@ -74,12 +70,16 @@ pub struct LendOptions {
     pub wan: Option<String>,
     /// Destinations refused on top of the default policy and this host's own networks.
     pub extra_deny: Vec<Ipv4Net>,
-    pub blocked_tcp_ports: Vec<u16>,
+    /// What clients may reach: [`Ports::Reduced`] for users' exits.
+    pub ports: Ports,
     /// Per session and direction; 0 = unlimited.
     pub rate_mbps: u64,
     pub max_sessions: usize,
     /// The node's listen addresses; replies from their ports bypass our own tunnel.
     pub listen: Vec<Multiaddr>,
+    /// Queues of the exit TUN device, each read by its own task (see
+    /// [`TunDevice::create_queues`]): more for busy dedicated exits.
+    pub tun_queues: usize,
 }
 
 /// What other parts of the program need to know about lending, cheaply cloneable.
@@ -94,11 +94,43 @@ pub struct LendingHandle {
     pub pool: IpPool,
     pub wan: String,
     pub rate_mbps: u64,
+    /// The exit's own public addresses, refused as destinations.
+    pub self_addrs: SelfAddrs,
+    /// Set when the default route or this host's networks changed since lending
+    /// started: the firewall, the policy and the bypass table are then stale, so
+    /// lending must be restarted (the service does that by itself).
+    pub network_changed: Arc<AtomicBool>,
+    /// Set when peers agree this network's public address changed (an internet
+    /// provider assigning a new one, with nothing changing on this host).
+    pub public_ip_changed: Arc<AtomicBool>,
+    pub started: Instant,
 }
 
 impl LendingHandle {
     pub fn ready(&self, status: &NodeStatus) -> bool {
-        lending_ready(status, self.alive.load(Ordering::Relaxed))
+        lending_ready(status, self.alive.load(Ordering::Relaxed) && !self.network_changed())
+    }
+
+    pub fn network_changed(&self) -> bool {
+        self.network_changed.load(Ordering::Relaxed)
+    }
+
+    /// The public address changed and this session is old enough to be replaced: the
+    /// service then starts a new one, with a new identity, so peers can't link the old
+    /// address to the new one through this node's ID.
+    pub fn public_ip_changed(&self) -> bool {
+        self.public_ip_changed.load(Ordering::Relaxed) && self.started.elapsed() >= MIN_SESSION_AGE_FOR_ROTATION
+    }
+
+    /// Refuses `ip` (an address peers see this machine at) as a destination, in the
+    /// exit policy and in the firewall. Runs `nft`, so call it off the async threads.
+    pub fn add_self_addr(&self, ip: Ipv4Addr) {
+        if !crate::addrs::is_public_v4(ip) || !self.self_addrs.add(ip) {
+            return;
+        }
+        if let Err(e) = platform::exit::deny_destination(ip) {
+            warn!("could not add this exit's public address to the firewall: {e:#}");
+        }
     }
 }
 
@@ -112,44 +144,50 @@ pub fn lending_ready(status: &NodeStatus, forwarder_alive: bool) -> bool {
 pub struct Lending {
     handle: LendingHandle,
     forwarder: JoinHandle<()>,
-    _system: SystemGuard,
+    watcher: JoinHandle<()>,
+    _system: ExitNetwork,
 }
 
 impl Lending {
     /// Starts lending. `sessions` and `pool` come from a node spawned with an exit config.
     pub fn start(sessions: mpsc::Receiver<ExitSession>, pool: IpPool, options: LendOptions) -> anyhow::Result<Self> {
         // Checked before anything changes on the system.
-        let original_default = system::default_route()?.context("no default route; lending needs an internet connection")?;
+        let original_default = net::default_route()?.context("no default route; lending needs an internet connection")?;
         let wan = options.wan.clone().unwrap_or_else(|| original_default.dev.clone());
-        if !valid_interface_name(&wan) {
+        if !platform::valid_interface_name(&wan) {
             bail!("invalid WAN interface name {wan:?}");
         }
-        let device = Arc::new(
-            TunDevice::create(EXIT_TUN, EXIT_TUN_ADDR, EXIT_TUN_PREFIX, MTU).context("creating the exit TUN device")?,
-        );
+        let queues: Vec<Arc<TunDevice>> = TunDevice::create_queues(EXIT_TUN, EXIT_TUN_ADDR, EXIT_TUN_PREFIX, MTU, options.tun_queues)
+            .context("creating the exit TUN device")?
+            .into_iter()
+            .map(Arc::new)
+            .collect();
 
         // Never let clients reach this host or the networks it's attached to.
-        let mut deny = system::local_ipv4_networks()?;
+        let network = NetworkSnapshot::current()?;
+        let mut deny = network.local_networks.clone();
         deny.extend(options.extra_deny);
+        let policy = ExitPolicy::new(deny, options.ports.clone());
+        let self_addrs = policy.self_addrs.clone();
         let exit_options = Arc::new(ExitOptions {
-            policy: ExitPolicy::new(deny, options.blocked_tcp_ports),
+            policy,
             rate_mbps: options.rate_mbps,
         });
 
-        let mut guard = SystemGuard::default();
-        guard.firewall(&wan)?;
-        guard.bypass_routes(&original_default, &listen_ports(&options.listen))?;
+        let system = ExitNetwork::install(&wan, &options.ports, &original_default, &listen_ports(&options.listen))?;
 
         let active = Arc::new(AtomicUsize::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let forwarder = tokio::spawn({
             let (active, alive) = (active.clone(), alive.clone());
             async move {
-                exit::forward(device, sessions, exit_options, active).await;
+                exit::forward_queues(queues, sessions, exit_options, active).await;
                 alive.store(false, Ordering::Relaxed);
                 warn!("exit forwarder stopped; lending is down");
             }
         });
+        let network_changed = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::spawn(watch_network(network, network_changed.clone()));
         info!(wan = %wan, "lending: exit enabled on {EXIT_TUN} ({EXIT_TUN_ADDR}/{EXIT_TUN_PREFIX})");
         Ok(Self {
             handle: LendingHandle {
@@ -159,9 +197,14 @@ impl Lending {
                 pool,
                 wan,
                 rate_mbps: options.rate_mbps,
+                self_addrs,
+                network_changed,
+                public_ip_changed: Arc::new(AtomicBool::new(false)),
+                started: Instant::now(),
             },
             forwarder,
-            _system: guard,
+            watcher,
+            _system: system,
         })
     }
 
@@ -174,168 +217,84 @@ impl Drop for Lending {
     fn drop(&mut self) {
         // Stop forwarding before the firewall and routes go away.
         self.forwarder.abort();
+        self.watcher.abort();
     }
 }
 
-/// System changes made for lending, undone in reverse order on drop.
-#[derive(Default)]
-struct SystemGuard {
-    undo: Vec<Box<dyn FnOnce() -> anyhow::Result<()> + Send + Sync>>,
-}
-
-impl SystemGuard {
-    fn firewall(&mut self, wan: &str) -> anyhow::Result<()> {
-        recover_stale_state()?;
-
-        // The original value is kept in /run until we restore it, so it survives a crash
-        // (and the next run restores it, not the 1 we set).
-        let saved = forward_state_file()?;
-        let previous = match std::fs::read_to_string(&saved) {
-            Ok(value) => value,
-            Err(_) => {
-                let value = std::fs::read_to_string(IP_FORWARD).context("reading ip_forward")?;
-                std::fs::write(&saved, &value).context("saving the ip_forward setting")?;
-                value
+/// Keeps feeding the addresses peers see this machine at into the exit's deny list (see
+/// [`crate::policy::SelfAddrs`]) until the node stops.
+pub fn watch_own_addresses(handle: NodeHandle, lending: LendingHandle) {
+    tokio::spawn(async move {
+        let mut first_confirmed = None;
+        loop {
+            let Ok(status) = handle.status().await else {
+                return;
+            };
+            if let Some(ip) = status.confirmed_public_ip {
+                let first = *first_confirmed.get_or_insert(ip);
+                if ip != first && !lending.public_ip_changed.swap(true, Ordering::Relaxed) {
+                    info!("this network's public address changed");
+                }
             }
-        };
-        std::fs::write(IP_FORWARD, "1").context("enabling IPv4 forwarding")?;
-        self.undo.push(Box::new(move || {
-            std::fs::write(IP_FORWARD, previous.trim())?;
-            Ok(std::fs::remove_file(&saved)?)
-        }));
-
-        system::run_with_stdin("nft", &["-f", "-"], Some(&nft_ruleset(wan)))?;
-        self.undo.push(Box::new(|| system::run("nft", &["delete", "table", "ip", NFT_TABLE]).map(drop)));
-        Ok(())
-    }
-
-    fn bypass_routes(&mut self, original_default: &system::NextHop, ports: &[(&'static str, u16)]) -> anyhow::Result<()> {
-        let mut add = vec!["-4", "route", "replace", "default"];
-        let hop = original_default.args();
-        add.extend(hop.iter().map(String::as_str));
-        add.extend(["table", BYPASS_TABLE]);
-        system::run("ip", &add)?;
-        self.undo.push(Box::new(|| system::run("ip", &["-4", "route", "flush", "table", BYPASS_TABLE]).map(drop)));
-
-        let mut selectors: Vec<Vec<String>> = vec![vec!["iif".into(), EXIT_TUN.into()]];
-        for (protocol, port) in ports {
-            selectors.push(vec!["ipproto".into(), protocol.to_string(), "sport".into(), port.to_string()]);
+            let ips: Vec<Ipv4Addr> = status
+                .external_addrs
+                .iter()
+                // A relay-circuit address carries the relay's IP, not ours.
+                .filter(|addr| !crate::addrs::is_circuit(addr))
+                .filter_map(crate::addrs::ip_of)
+                .filter_map(|ip| match ip {
+                    std::net::IpAddr::V4(v4) => Some(v4),
+                    std::net::IpAddr::V6(_) => None,
+                })
+                .chain(status.observed_addrs.iter().copied())
+                .collect();
+            let lending = lending.clone();
+            let _ = tokio::task::spawn_blocking(move || ips.into_iter().for_each(|ip| lending.add_self_addr(ip))).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
-        for selector in selectors {
-            for action in [
-                ["lookup", "main", "suppress_prefixlength", "1", "pref", PREF_MAIN_SUPPRESSED].as_slice(),
-                ["lookup", BYPASS_TABLE, "pref", PREF_BYPASS].as_slice(),
-            ] {
-                let mut rule: Vec<String> = ["-4", "rule", "add"].map(String::from).to_vec();
-                rule.extend(selector.iter().cloned());
-                rule.extend(action.iter().map(|s| s.to_string()));
-                system::run("ip", &rule.iter().map(String::as_str).collect::<Vec<_>>())?;
-                rule[2] = "del".into();
-                self.undo.push(Box::new(move || {
-                    system::run("ip", &rule.iter().map(String::as_str).collect::<Vec<_>>()).map(drop)
-                }));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for SystemGuard {
-    fn drop(&mut self) {
-        for undo in self.undo.drain(..).rev() {
-            if let Err(e) = undo() {
-                warn!("lending cleanup step failed: {e:#}");
-            }
-        }
-        if !std::thread::panicking() {
-            info!("lending stopped; firewall and routing restored");
-        }
-    }
-}
-
-/// Removes the firewall table and policy-routing rules a previous dvpn left behind when
-/// it couldn't clean up (killed with SIGKILL, crashed, power loss). Refuses instead if
-/// another dvpn runs in this network namespace, since they may be its.
-pub fn recover_stale_state() -> anyhow::Result<()> {
-    let table = system::run("nft", &["list", "table", "ip", NFT_TABLE]).is_ok();
-    let rules = system::run("ip", &["-4", "rule", "show"]).is_ok_and(|out| {
-        out.lines()
-            .any(|l| l.starts_with(&format!("{PREF_MAIN_SUPPRESSED}:")) || l.starts_with(&format!("{PREF_BYPASS}:")))
     });
-    if !table && !rules {
-        return Ok(());
-    }
-    if other_dvpn_in_this_namespace() {
-        bail!(
-            "another dvpn is already lending on this machine (nftables table `ip {NFT_TABLE}` exists); \
-             stop it first, or if none is running, remove the leftovers with `sudo scripts/exit-teardown.sh`"
-        );
-    }
-    if table {
-        system::run("nft", &["delete", "table", "ip", NFT_TABLE])?;
-    }
-    for pref in [PREF_MAIN_SUPPRESSED, PREF_BYPASS] {
-        while system::run("ip", &["-4", "rule", "del", "pref", pref]).is_ok() {}
-    }
-    let _ = system::run("ip", &["-4", "route", "flush", "table", BYPASS_TABLE]);
-    warn!("removed firewall and routing rules left behind by a dvpn that didn't shut down cleanly");
-    Ok(())
 }
 
-/// Whether another root process named `dvpn` shares our network namespace (needs root
-/// to read other processes' namespaces, which lending has). Unprivileged `dvpn`
-/// processes can't lend, so they don't count.
-fn other_dvpn_in_this_namespace() -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let ours = std::fs::read_link("/proc/self/ns/net").ok();
-    let me = std::process::id().to_string();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let pid = entry.file_name();
-        let pid = pid.to_string_lossy();
-        pid.chars().all(|c| c.is_ascii_digit())
-            && pid != me
-            && std::fs::metadata(entry.path()).is_ok_and(|m| m.uid() == 0)
-            && std::fs::read_to_string(entry.path().join("comm")).is_ok_and(|c| c.trim() == "dvpn")
-            // Unreadable (the sandboxed service lacks CAP_SYS_PTRACE): assume it's here,
-            // rather than remove rules another dvpn may be using.
-            && std::fs::read_link(entry.path().join("ns/net")).map_or(true, |ns| Some(ns) == ours)
-    })
+/// What lending's firewall, policy and bypass table were built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkSnapshot {
+    default_route: Option<net::NextHop>,
+    /// This host's networks, without dvpn's own virtual ones.
+    local_networks: Vec<Ipv4Net>,
 }
 
-/// `/run/dvpn-ip-forward-<netns>`: per network namespace, since each has its own
-/// ip_forward (the netns test harness runs several exits on one host).
-fn forward_state_file() -> anyhow::Result<std::path::PathBuf> {
-    let ns = std::fs::read_link("/proc/self/ns/net").context("reading the network namespace")?;
-    let id: String = ns.to_string_lossy().chars().filter(char::is_ascii_digit).collect();
-    Ok(std::path::PathBuf::from(format!("/run/dvpn-ip-forward-{id}")))
+impl NetworkSnapshot {
+    fn current() -> anyhow::Result<Self> {
+        let pool: Ipv4Net = POOL.parse().expect("valid pool");
+        let mut local_networks: Vec<Ipv4Net> = net::local_ipv4_networks()?
+            .into_iter()
+            .filter(|net| !pool.contains(net))
+            .collect();
+        local_networks.sort();
+        local_networks.dedup();
+        Ok(Self {
+            default_route: net::default_route()?,
+            local_networks,
+        })
+    }
 }
 
-/// The nftables table an exit needs; the same rules as scripts/exit-setup.sh.
-pub fn nft_ruleset(wan: &str) -> String {
-    format!(
-        r#"table ip {NFT_TABLE} {{
-    chain postrouting {{
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr {POOL} oifname "{wan}" masquerade
-    }}
-    chain forward {{
-        type filter hook forward priority filter; policy accept;
-        iifname "{EXIT_TUN}" oifname != "{wan}" drop
-        iifname "{EXIT_TUN}" ip daddr {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }} drop
-        iifname "{EXIT_TUN}" tcp dport 25 drop
-        oifname "{EXIT_TUN}" ct state established,related accept
-        oifname "{EXIT_TUN}" drop
-    }}
-    chain input {{
-        type filter hook input priority filter; policy accept;
-        iifname "{EXIT_TUN}" drop
-    }}
-}}
-"#
-    )
+/// Sets `changed` once this machine's default route or networks differ from `start`
+/// (e.g. it moved from cable to Wi-Fi). Lending built for the old network would drop
+/// lent traffic (the firewall names the old WAN interface) or let clients reach the new
+/// LAN if its addresses are public, so it must be rebuilt.
+async fn watch_network(start: NetworkSnapshot, changed: Arc<AtomicBool>) {
+    loop {
+        tokio::time::sleep(NETWORK_CHECK_INTERVAL).await;
+        let Ok(Ok(now)) = tokio::task::spawn_blocking(NetworkSnapshot::current).await else {
+            continue;
+        };
+        if now != start {
+            warn!("this machine changed networks; lending must restart for the new one");
+            changed.store(true, Ordering::Relaxed);
+            return;
+        }
+    }
 }
 
 /// TCP and UDP ports the node listens on.
@@ -357,12 +316,6 @@ pub fn listen_ports(listen: &[Multiaddr]) -> Vec<(&'static str, u16)> {
     ports
 }
 
-/// Linux interface names: at most 15 characters, no quotes or spaces. Checked because
-/// the WAN name is written into the nftables ruleset.
-pub fn valid_interface_name(name: &str) -> bool {
-    !name.is_empty() && name.len() < 16 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +328,8 @@ mod tests {
             hole_punches: 0,
             publicly_reachable: public,
             exit_published: published,
+            observed_addrs: vec![],
+            confirmed_public_ip: None,
         }
     }
 
@@ -392,34 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn ruleset_nats_the_pool_out_of_the_wan_and_confines_clients() {
-        let rules = nft_ruleset("eth0");
-        assert!(rules.contains(r#"ip saddr 10.77.0.0/16 oifname "eth0" masquerade"#));
-        assert!(rules.contains(r#"iifname "dvpn-exit" oifname != "eth0" drop"#));
-        assert!(rules.contains(r#"iifname "dvpn-exit" tcp dport 25 drop"#));
-        assert!(rules.contains("192.168.0.0/16"));
-        // Nothing may start a connection towards clients through the exit.
-        assert!(rules.contains(r#"oifname "dvpn-exit" ct state established,related accept"#));
-        assert!(rules.contains(r#"oifname "dvpn-exit" drop"#));
-        // The input chain keeps clients away from services on this host.
-        assert!(rules.contains("chain input {\n        type filter hook input priority filter; policy accept;\n        iifname \"dvpn-exit\" drop"));
-    }
-
-    #[test]
     fn finds_listen_ports() {
         let listen: Vec<Multiaddr> = ["/ip4/0.0.0.0/tcp/4001", "/ip4/0.0.0.0/udp/4001/quic-v1", "/ip6/::/tcp/4001", "/ip4/0.0.0.0/tcp/0"]
             .iter()
             .map(|a| a.parse().unwrap())
             .collect();
         assert_eq!(listen_ports(&listen), [("tcp", 4001), ("udp", 4001)]);
-    }
-
-    #[test]
-    fn interface_names_are_checked() {
-        assert!(valid_interface_name("eth0"));
-        assert!(valid_interface_name("wlp2s0"));
-        assert!(!valid_interface_name(""));
-        assert!(!valid_interface_name("eth0\" drop; #"));
-        assert!(!valid_interface_name("averyveryverylongname"));
     }
 }

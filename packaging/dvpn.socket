@@ -3,10 +3,11 @@ Description=dvpn control socket
 
 [Socket]
 ListenStream=/run/dvpn/control.sock
-# Members of the dvpn group control the VPN; nobody else can open the socket.
+# Anyone may connect; the service itself decides whom it answers: people signed in at
+# this computer (polkit action dev.dvpn.control) and members of the dvpn group.
 SocketUser=root
-SocketGroup=dvpn
-SocketMode=0660
+SocketGroup=root
+SocketMode=0666
 DirectoryMode=0755
 RemoveOnStop=yes
 

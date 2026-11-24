@@ -21,10 +21,31 @@ TimeoutStopSec=30
 
 # Hardening that keeps what a VPN client and exit need: network administration,
 # /proc/sys/net (IPv4 forwarding), /dev/net/tun, `ip`, `nft` and systemd-resolved.
+# Only CAP_NET_ADMIN: the listen ports are above 1024 and `ip`/`nft` use netlink.
+# Not root: its own user, with network administration as its only privilege. `ip`,
+# `nft` and `resolvectl` inherit it (ambient), and polkit lets this user check who may
+# use the app and set DNS on the tunnel (packaging/dev.dvpn.policy, dvpn.rules).
+User=dvpn
+Group=dvpn
+AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
-ProtectSystem=full
+CapabilityBoundingSet=CAP_NET_ADMIN
+# The whole file system is read-only except the state directory and the runtime
+# directory (the ip_forward backup, kept across restarts so a crashed run's value can
+# be restored). The control socket comes from dvpn.socket.
+ProtectSystem=strict
+RuntimeDirectory=dvpn-state
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 ProtectHome=yes
+UMask=0077
+# Only the TUN device (no PrivateDevices: it would hide /dev/net/tun).
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 PrivateTmp=yes
 ProtectControlGroups=yes
 ProtectClock=yes

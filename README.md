@@ -32,8 +32,10 @@ cargo deb -p dvpn-gui      # target/debian/dvpn-gui_<version>_amd64.deb
 sudo apt install ./target/debian/dvpn_*.deb ./target/debian/dvpn-gui_*.deb
 ```
 
-Installing adds you to the `dvpn` group. Log out and back in once, then open **dvpn**
-from your applications menu. Older versions could install a `dvpn` command to
+Then open **dvpn** from your applications menu; there's nothing to set up. Anyone
+signed in at this computer can use the app (via polkit). For other accounts, e.g. over
+SSH, an administrator can run `sudo usermod -aG dvpn <user>`; that applies at once,
+without logging out. Older versions could install a `dvpn` command to
 `/usr/local/bin`; if you did that, remove it with `sudo rm /usr/local/bin/dvpn`.
 
 ## Use it
@@ -51,9 +53,10 @@ from your applications menu. Older versions could install a `dvpn` command to
 The app shows:
 - **Lending:** whether others can use your exit (directly or through a relay), and
   active sessions;
-- **VPN:** disconnected, waiting for lending, connecting, connected (with exit, relay
-  and tunnel IP), reconnecting or paused, plus warnings such as DNS not going through
-  the tunnel;
+- **VPN:** disconnected, waiting for lending, connecting, connected (with the IP your
+  traffic appears to come from, the kind of exit, latency, data sent and received, and
+  whether packets go as UDP datagrams), reconnecting or paused, plus warnings such as
+  DNS not going through the tunnel;
 - **Exit selection:** random, or max ping with a live count of how many measured exits
   are within your limit;
 - the recent log.
@@ -75,38 +78,59 @@ doesn't connect and keeps retrying.
 Either way, exits run by other users who lend while connected are used only if no
 dedicated exit fits. You switch to a dedicated exit as soon as one is available.
 
+Once connected, packets travel as UDP datagrams through the relay where possible, so
+a lost packet doesn't hold up the others (smoother on Wi-Fi and mobile, and for calls
+and games). Where UDP is blocked, they go over the circuit's encrypted stream instead,
+and dvpn switches back and forth by itself.
+
 While connected:
 - all IPv4 traffic goes through `dvpn0`,
 - IPv6 is blocked,
-- DNS goes through the tunnel (default `9.9.9.9`, via systemd-resolved),
+- nothing leaves your machine outside the tunnel, except to your LAN and dvpn's own
+  traffic, even if your network pushes routes around it,
+- DNS goes through the tunnel, encrypted (default `9.9.9.9` with DNS-over-TLS, via
+  systemd-resolved), so the exit can't read it,
 - nothing can start a connection to your machine through the tunnel; only replies
   to your own connections come in. (The exit is untrusted, and would otherwise reach
   services listening on your machine.)
 
-Protection starts once the first circuit is up; until then your traffic goes out
-normally, and the app says "Not protected yet". After that, if the circuit drops,
-traffic is **blocked** (not leaked) until a new one is up. Turning off, or stopping the
-service, restores your routes and firewall. If the service crashes, its next start
-cleans up after it; `sudo /usr/share/dvpn/exit-teardown.sh` also does it by hand.
+Protection starts the moment you click **Connect** and lasts until you disconnect:
+while connecting, if the circuit drops, or if something fails, traffic is **blocked**
+(not leaked) and dvpn reconnects by itself. If the service crashes while connected,
+traffic stays blocked and its next start reconnects. Disconnecting, turning off or
+stopping the service restores your routes and firewall;
+`sudo /usr/share/dvpn/exit-teardown.sh` removes leftovers by hand.
 
-Your exit refuses traffic to private networks (including your own LAN), your machine
-itself and SMTP. Each session is rate-limited to 10 Mbit/s.
+Your exit only carries common services: the web, DNS, email (but not direct
+connections to mail servers, the usual route for spam), SSH, chat, calls and the like.
+Other ports, such as file sharing, are refused, and so is traffic to private networks
+(including your own LAN), your machine and your router's public address. Each session
+is rate-limited to 10 Mbit/s. The same goes for other users' exits you might use: they
+are a last resort, and the app tells you when you're on one.
+
+To the network, your computer is a new node every time dvpn starts, restarts, your
+computer changes networks or your internet provider gives you a new address (lending
+and the VPN restart then too), so peers can't recognise it from one session to the
+next. It isn't announced on your local network.
 
 ### The service
 
-The service (run by systemd) does the networking as root; the app is its client and
-needs no sudo.
+The service (run by systemd) does the networking, as its own user `dvpn` with only
+network-administration rights, not as root; the app is its client and needs no sudo.
 - **When it runs:** it starts at boot, idle: it does nothing on the network until you
   lend or connect, or until it starts lending by itself if lending at boot is on (the
   default, once the lending terms are accepted). If that fails (e.g. no network yet),
   it tries again every 30 s. **Turn off** stops it until the next boot.
-- **Who can control it:** only root and members of the `dvpn` group can open its
-  control socket (`/run/dvpn/control.sock`).
+- **Who can control it:** anyone signed in at this computer (polkit action
+  `dev.dvpn.control`), and members of the `dvpn` group, through its control socket
+  (`/run/dvpn/control.sock`).
 - **Where its data is:** `/var/lib/dvpn`. Its options (DNS server, rate limits, exit
   deny list, …) are in `/etc/default/dvpn`.
-- **Logs:** in the app, or `journalctl -u dvpn`.
+- **Logs:** in the app. `journalctl -u dvpn` keeps only warnings, so your usage
+  history isn't written to disk.
 
-To give another account control: `sudo usermod -aG dvpn <user>`.
+To give another account control (e.g. over SSH): `sudo usermod -aG dvpn <user>`. It
+applies right away.
 Removing the packages keeps the node's keys; `sudo apt purge dvpn` deletes them.
 
 ### Behind NAT
@@ -131,18 +155,30 @@ A node run under `sudo` uses root's own identity, in `/root/.local/share/dvpn` u
 you pass `--data-dir`. A dedicated exit sets up IPv4 forwarding, NAT and the forwarding
 restrictions itself, and removes them on exit (`sudo scripts/exit-teardown.sh` if it
 was killed). `scripts/exit-setup.sh` shows the same rules for review. Besides the
-refusals above, `--exit-deny <cidr>` adds more; its sessions are rate-limited to
-20 Mbit/s by default.
+refusals above, `--exit-deny <cidr>` adds more. Unlike users' exits, a dedicated exit forwards every port
+except SMTP (TCP 25). Its sessions are rate-limited to 20 Mbit/s by default, and it keeps
+the identity `dvpn init` created, so its bootstrap address stays valid.
+
+Complaints about traffic from a dedicated exit reach its operator. `--exit-notice`
+serves a page on port 80 of the exit's address that explains it is a dvpn exit and
+keeps no logs (like a Tor exit notice); `--exit-contact abuse@example.org` adds a
+contact, and `--exit-notice-listen` picks another address or port.
+
+Relays must be reachable on UDP port 4002 as well as their listen ports, for the
+datagram path (`--datagram-port` changes it). Without it, circuits through them still
+work, over streams only.
 
 In a LAN-only network, run at least one node with
-`--reachability public --allow-private-addrs`. Bootstrap peers can also be listed in
+`--reachability public --allow-private-addrs`; `--mdns` lets nodes find each other there.
+Bootstrap peers can also be listed in
 `<data-dir>/config.json`:
 
 ```json
 { "bootstrap": ["/ip4/203.0.113.7/tcp/4001/p2p/12D3KooW..."] }
 ```
 
-All commands accept `--data-dir` and `--debug`; `dvpn <command> --help` has the rest.
+All commands accept `--data-dir` and `--debug`, and `run`, `connect` and `daemon` accept
+`--mdns`, `--datagram-port` and `--no-datagrams`; `dvpn <command> --help` has the rest.
 
 | Command | Main options |
 |---|---|
@@ -161,7 +197,7 @@ sudo scripts/netns-test.sh       # real TUN, routes and NAT in throwaway namespa
 | Test | What it starts | What it checks |
 |---|---|---|
 | `tests/discovery.rs` | real nodes on localhost | DHT discovery and rejoining from the peer cache |
-| `tests/circuits.rs` | real nodes on localhost | end-to-end 2-hop circuits; refusal by non-exit and non-relay nodes |
+| `tests/circuits.rs` | real nodes on localhost | end-to-end 2-hop circuits; the switch to datagrams, and staying on the stream through a relay without them; refusal by non-exit and non-relay nodes |
 | `tests/nat.rs` | real nodes on localhost | AutoNAT, relay reservations, an exit behind NAT |
 | `tests/tunnel_crypto.rs` | a client and exit joined by an in-memory relay | the relay can't read, tamper with or replay traffic; an impostor exit is rejected |
 | `tests/keepalive.rs` | a client and exit on an in-memory pipe, with a simulated clock | idle tunnels stay up; an exit that silently stops answering is detected; the exit frees silent sessions |
@@ -169,4 +205,4 @@ sudo scripts/netns-test.sh       # real TUN, routes and NAT in throwaway namespa
 | `tests/selection.rs` | real nodes on localhost | dedicated exits before other users' exits; max-ping measures through test circuits, picks within the limit, and reports when nothing qualifies |
 | `tests/daemon.rs` | the service on a temporary socket (lending can't start without root) | socket permissions, consent before anything starts, start failures reported to clients, lending at boot, bootstrap peers validated and saved, several clients at once, malformed requests |
 | `tests/data_path.rs` | real nodes, with in-memory devices instead of TUN | the full packet path, exit policy and anti-spoofing; the status socket |
-| `scripts/netns-test.sh` | real TUN devices, routes and NAT in network namespaces (needs root) | identity swapping as seen by a web server, exit policy, kill switch, reconnect, a silently frozen exit, firewall and route cleanup, an exit behind NAT, another user's exit used only as a last resort, then left for a dedicated exit; max-ping mode; kill-switch routes surviving reconnects |
+| `scripts/netns-test.sh` | real TUN devices, routes and NAT in network namespaces (needs root) | identity swapping as seen by a web server, exit policy, UDP datagrams and the fall-back to the stream when the relay's UDP is blocked, kill switch, reconnect, a silently frozen exit, firewall and route cleanup, an exit behind NAT, another user's exit used only as a last resort, then left for a dedicated exit; max-ping mode; kill-switch routes surviving reconnects |

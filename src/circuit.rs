@@ -1,16 +1,22 @@
 //! Circuits: client → entry relay (splice) → exit, with an end-to-end Noise_NK session.
 //!
-//! - `/dvpn/splice/1`: the client asks a relay to connect it to an exit. The relay then
-//!   pipes bytes both ways without being able to read them.
-//! - `/dvpn/exit/1`: the Noise_NK handshake and encrypted, padded IP packets. The client
-//!   has no static key, so the exit cannot identify or link clients. An empty packet is
-//!   a keepalive: padded and encrypted, it looks like any small packet to a relay.
+//! - `/dvpn/splice/2`: the client asks a relay to connect it to an exit. The relay then
+//!   pipes bytes both ways without being able to read them, and offers both sides a
+//!   [`datagram`](crate::datagram) path through it.
+//! - `/dvpn/exit/2`: the relay's offer, then the Noise_NK handshake and encrypted,
+//!   padded IP packets. The client has no static key, so the exit cannot identify or
+//!   link clients. An empty packet is a keepalive: padded and encrypted, it looks like
+//!   any small packet to a relay.
+//!
+//! Packets go over the stream until datagrams arrive from the other end, then as
+//! datagrams for as long as they keep arriving. The stream stays open: it carries the
+//! handshake, packets whenever datagrams don't get through, and the circuit's lifetime.
 //!
 //! See docs/DESIGN.md §3.4.
 
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,22 +30,39 @@ use tracing::debug;
 use zeroize::Zeroizing;
 
 use crate::addrs;
-use crate::framing::{MAX_FRAME, MAX_PADDED_PACKET, pad, read_frame, unpad, write_frame};
-use crate::identity::NOISE_PARAMS;
+use crate::datagram::{self, E2eReceiver, E2eSecrets, E2eSender, EndpointRx, EndpointTx, Liveness, Offer};
+use crate::framing::{MAX_FRAME, MAX_PADDED_PACKET, PAD_BUCKETS, pad, pad_into, read_frame, read_frame_into, unpad, write_frame};
+use crate::identity::{ExitKeys, NOISE_PARAMS};
 use crate::node::NodeHandle;
 use crate::ratelimit::TokenBucket;
 use crate::records::MAX_RECORD_ADDRS;
 
-pub const SPLICE_PROTOCOL: StreamProtocol = StreamProtocol::new("/dvpn/splice/1");
-pub const EXIT_PROTOCOL: StreamProtocol = StreamProtocol::new("/dvpn/exit/1");
+pub const SPLICE_PROTOCOL: StreamProtocol = StreamProtocol::new("/dvpn/splice/2");
+pub const EXIT_PROTOCOL: StreamProtocol = StreamProtocol::new("/dvpn/exit/2");
 
-/// Largest IP packet carried through a circuit.
-pub const MTU: u16 = 1400;
+/// Largest IP packet carried through a circuit. Small enough that a full-size packet,
+/// padded and sent as a datagram, still fits a DS-Lite (1460) or PPPoE (1492) link
+/// unfragmented, with room to spare.
+pub const MTU: u16 = 1360;
 const _: () = assert!(MTU as usize <= MAX_PADDED_PACKET);
+/// IPv4 + UDP headers around a datagram.
+const IP_UDP_HEADERS: usize = 28;
+const _: () = assert!(PAD_BUCKETS[PAD_BUCKETS.len() - 1] + datagram::OVERHEAD + IP_UDP_HEADERS <= 1452);
 
-const PROLOGUE: &[u8] = b"dvpn-circuit-v1";
-const PROTOCOL_VERSION: u8 = 1;
+/// Followed by the exit's peer ID, so the handshake is bound to the exit the client
+/// meant to reach, not just to its key.
+const PROLOGUE: &[u8] = b"dvpn-circuit-v2";
+const PROTOCOL_VERSION: u8 = 2;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The exit's side of the handshake is shorter: a slot is held while it runs, and an
+/// honest client answers within a round trip.
+const EXIT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Each direction switches to a new key after this many messages (both sides count the
+/// same messages on the ordered stream), so a key exposed later, e.g. by reading an
+/// endpoint's memory, decrypts only a window of a long session, not all of it.
+pub const REKEY_EVERY: u64 = 1 << 14;
+/// Splices a relay runs for one requesting peer at a time.
+const MAX_SPLICES_PER_PEER: usize = 8;
 const EXIT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SPLICES: usize = 64;
 
@@ -89,8 +112,19 @@ impl From<snow::Error> for CircuitError {
 struct SpliceRequest {
     exit: Vec<u8>,
     addrs: Vec<Vec<u8>>,
+    /// The client can use a datagram path.
+    datagrams: bool,
 }
 
+/// The relay's first frame on the exit stream, before the client's handshake.
+#[derive(Serialize, Deserialize)]
+struct RelayHello {
+    datagrams: Option<Offer>,
+}
+
+/// The client's first handshake message. Its payload is encrypted only to the exit's
+/// static key (`es`): not forward-secret, and an observer can replay it. So it must
+/// never carry anything secret or identifying; today it holds only the version.
 #[derive(Serialize, Deserialize)]
 struct ClientHello {
     version: u8,
@@ -100,6 +134,14 @@ struct ClientHello {
 struct ExitHello {
     assigned_ip: [u8; 4],
     mtu: u16,
+    /// Keys for the datagram path: client → exit, exit → client.
+    datagram_keys: [[u8; 32]; 2],
+}
+
+impl Drop for ExitHello {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.datagram_keys);
+    }
 }
 
 type BoxStream = Box<dyn AsyncReadWrite>;
@@ -116,18 +158,136 @@ pub struct Tunnel {
     pub mtu: u16,
     pub tx: TunnelSender,
     pub rx: TunnelReceiver,
+    /// Keys for a datagram path, until one is attached.
+    e2e: Option<(E2eSecrets, Role)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Client,
+    Exit,
 }
 
 pub struct TunnelSender {
     writer: WriteHalf<BoxStream>,
     noise: Arc<Mutex<snow::TransportState>>,
+    /// Reused for every packet: the padded plaintext, and the frame on the stream.
+    plaintext: Vec<u8>,
+    frame: Vec<u8>,
+    datagrams: Option<Arc<DatagramSender>>,
+    _prober: Option<AbortOnDrop>,
     _guard: Option<Guard>,
 }
 
 pub struct TunnelReceiver {
-    reader: ReadHalf<BoxStream>,
+    stream: StreamSource,
     noise: Arc<Mutex<snow::TransportState>>,
+    /// Reused for every packet: the frame read from the stream, and its plaintext.
+    frame: Vec<u8>,
+    plaintext: Vec<u8>,
+    datagrams: Option<DatagramReceiver>,
     _guard: Option<Guard>,
+}
+
+enum StreamSource {
+    Direct(ReadHalf<BoxStream>),
+    /// Read by a task, so waiting for a frame and for a datagram at once can't lose
+    /// half a frame when the datagram wins.
+    Task {
+        frames: mpsc::Receiver<std::io::Result<Option<Vec<u8>>>>,
+        _reader: AbortOnDrop,
+    },
+    Moving,
+}
+
+struct DatagramSender {
+    endpoint: EndpointTx,
+    e2e: Mutex<E2eSender>,
+    liveness: Liveness,
+}
+
+impl DatagramSender {
+    async fn send(&self, padded: &[u8]) -> std::io::Result<()> {
+        let sealed = self.e2e.lock().expect("e2e lock").seal(padded);
+        self.endpoint.send(&sealed).await
+    }
+}
+
+struct DatagramReceiver {
+    endpoint: EndpointRx,
+    e2e: E2eReceiver,
+    liveness: Liveness,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Tunnel {
+    /// Sends and receives through `socket` as well, by the relay's `offer`, if the relay
+    /// is reachable at `relay`. Returns whether a datagram path was set up; packets use
+    /// it once datagrams arrive from the other end.
+    pub fn attach_datagrams(&mut self, socket: &Arc<datagram::Socket>, offer: &Offer, relay: Ipv4Addr) -> bool {
+        let Some((secrets, role)) = self.e2e.take() else {
+            return false;
+        };
+        let Some((endpoint_tx, endpoint_rx)) = socket.endpoint(offer, relay) else {
+            return false;
+        };
+        let (send_key, recv_key) = match role {
+            Role::Client => (&secrets.client_to_exit, &secrets.exit_to_client),
+            Role::Exit => (&secrets.exit_to_client, &secrets.client_to_exit),
+        };
+        let liveness = Liveness::default();
+        let sender = Arc::new(DatagramSender {
+            endpoint: endpoint_tx,
+            e2e: Mutex::new(E2eSender::new(send_key)),
+            liveness: liveness.clone(),
+        });
+        self.rx.datagrams = Some(DatagramReceiver {
+            endpoint: endpoint_rx,
+            e2e: E2eReceiver::new(recv_key),
+            liveness: liveness.clone(),
+        });
+        if let StreamSource::Direct(mut reader) = std::mem::replace(&mut self.rx.stream, StreamSource::Moving) {
+            let (frames_tx, frames_rx) = mpsc::channel(64);
+            let task = tokio::spawn(async move {
+                loop {
+                    let frame = read_frame(&mut reader).await;
+                    let last = !matches!(frame, Ok(Some(_)));
+                    if frames_tx.send(frame).await.is_err() || last {
+                        return;
+                    }
+                }
+            });
+            self.rx.stream = StreamSource::Task {
+                frames: frames_rx,
+                _reader: AbortOnDrop(task),
+            };
+        }
+        let keepalive = pad(&[]).expect("empty packet fits");
+        let probing = sender.clone();
+        self.tx._prober = Some(AbortOnDrop(tokio::spawn(datagram::probe(liveness, move || {
+            let (sender, keepalive) = (probing.clone(), keepalive.clone());
+            async move { sender.send(&keepalive).await }
+        }))));
+        self.tx.datagrams = Some(sender);
+        true
+    }
+
+    /// Whether packets currently go out as datagrams.
+    pub fn uses_datagrams(&self) -> bool {
+        self.tx.uses_datagrams()
+    }
+
+    /// Tells whether datagrams arrive, for as long as the tunnel lives.
+    pub fn datagram_liveness(&self) -> Option<Liveness> {
+        self.tx.datagrams.as_ref().map(|d| d.liveness.clone())
+    }
 }
 
 impl TunnelSender {
@@ -135,10 +295,34 @@ impl TunnelSender {
         if packet.len() > MTU as usize {
             return Err(CircuitError::PacketTooLarge);
         }
-        let plaintext = pad(packet).ok_or(CircuitError::PacketTooLarge)?;
-        let mut frame = vec![0u8; plaintext.len() + 16];
-        let n = self.noise.lock().expect("noise lock").write_message(&plaintext, &mut frame)?;
-        write_frame(&mut self.writer, &frame[..n]).await?;
+        if !pad_into(packet, &mut self.plaintext) {
+            return Err(CircuitError::PacketTooLarge);
+        }
+        let plaintext = &self.plaintext;
+        if let Some(datagrams) = &self.datagrams
+            && datagrams.liveness.alive()
+            && datagrams.send(plaintext).await.is_ok()
+            // A keepalive after datagrams have been quiet for a while goes over the
+            // stream too: if the datagram path just died, the keepalive still gets
+            // through, and the circuit survives until packets switch back to the stream.
+            && !(packet.is_empty() && datagrams.liveness.quiet_for(KEEPALIVE_INTERVAL))
+        {
+            return Ok(());
+        }
+        // Length prefix and ciphertext in one buffer: one write, one frame on the stream.
+        let frame = &mut self.frame;
+        frame.resize(2 + plaintext.len() + 16, 0);
+        let n = {
+            let mut noise = self.noise.lock().expect("noise lock");
+            let n = noise.write_message(plaintext, &mut frame[2..])?;
+            if noise.sending_nonce().is_multiple_of(REKEY_EVERY) {
+                noise.rekey_outgoing();
+            }
+            n
+        };
+        frame[..2].copy_from_slice(&(n as u16).to_be_bytes());
+        self.writer.write_all(&frame[..2 + n]).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 
@@ -146,44 +330,103 @@ impl TunnelSender {
         self.writer.close().await?;
         Ok(())
     }
+
+    pub fn uses_datagrams(&self) -> bool {
+        self.datagrams.as_ref().is_some_and(|d| d.liveness.alive())
+    }
+}
+
+enum Incoming {
+    Frame(Option<Vec<u8>>),
+    Datagram(Vec<u8>),
 }
 
 impl TunnelReceiver {
     /// The next packet; `Ok(None)` when the peer closed the tunnel cleanly.
     /// Any frame that fails authentication ends the tunnel with [`CircuitError::Integrity`].
     pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, CircuitError> {
-        let Some(frame) = read_frame(&mut self.reader).await? else {
-            return Ok(None);
+        let from_task;
+        let frame: &[u8] = loop {
+            let incoming = match (&mut self.stream, &mut self.datagrams) {
+                (StreamSource::Direct(reader), _) => match read_frame_into(reader, &mut self.frame).await? {
+                    true => break &self.frame,
+                    false => return Ok(None),
+                },
+                (StreamSource::Task { frames, .. }, Some(datagrams)) => tokio::select! {
+                    frame = frames.recv() => Incoming::Frame(frame.unwrap_or(Ok(None))?),
+                    Some(datagram) = datagrams.endpoint.recv() => Incoming::Datagram(datagram),
+                },
+                (StreamSource::Task { frames, .. }, None) => Incoming::Frame(frames.recv().await.unwrap_or(Ok(None))?),
+                (StreamSource::Moving, _) => unreachable!("only while attaching"),
+            };
+            match incoming {
+                Incoming::Frame(Some(frame)) => {
+                    from_task = frame;
+                    break &from_task;
+                }
+                Incoming::Frame(None) => return Ok(None),
+                // Datagrams can be lost, duplicated or forged on the way; anything that
+                // doesn't authenticate is dropped, not fatal.
+                Incoming::Datagram(sealed) => {
+                    let datagrams = self.datagrams.as_mut().expect("datagram received");
+                    let Some(padded) = datagrams.e2e.open(&sealed) else { continue };
+                    datagrams.liveness.heard();
+                    if let Some(packet) = unpad(&padded) {
+                        return Ok(Some(packet.to_vec()));
+                    }
+                }
+            }
         };
-        let mut plaintext = vec![0u8; frame.len()];
-        let n = self
-            .noise
-            .lock()
-            .expect("noise lock")
-            .read_message(&frame, &mut plaintext)
-            .map_err(|_| CircuitError::Integrity)?;
+        let plaintext = &mut self.plaintext;
+        plaintext.resize(frame.len(), 0);
+        let n = {
+            let mut noise = self.noise.lock().expect("noise lock");
+            let n = noise.read_message(frame, plaintext).map_err(|_| CircuitError::Integrity)?;
+            if noise.receiving_nonce().is_multiple_of(REKEY_EVERY) {
+                noise.rekey_incoming();
+            }
+            n
+        };
         let packet = unpad(&plaintext[..n]).ok_or(CircuitError::Integrity)?;
         Ok(Some(packet.to_vec()))
     }
 }
 
-fn into_tunnel(stream: BoxStream, noise: snow::TransportState, hello: ExitHello, guard: Option<Guard>) -> Tunnel {
+fn into_tunnel(
+    stream: BoxStream,
+    noise: snow::HandshakeState,
+    role: Role,
+    hello: ExitHello,
+    guard: Option<Guard>,
+) -> Result<Tunnel, CircuitError> {
+    let secrets = E2eSecrets {
+        client_to_exit: Zeroizing::new(hello.datagram_keys[0]),
+        exit_to_client: Zeroizing::new(hello.datagram_keys[1]),
+    };
+    let noise = Arc::new(Mutex::new(noise.into_transport_mode()?));
     let (reader, writer) = stream.split();
-    let noise = Arc::new(Mutex::new(noise));
-    Tunnel {
+    Ok(Tunnel {
         assigned_ip: Ipv4Addr::from(hello.assigned_ip),
         mtu: hello.mtu,
         tx: TunnelSender {
             writer,
             noise: noise.clone(),
+            plaintext: Vec::new(),
+            frame: Vec::new(),
+            datagrams: None,
+            _prober: None,
             _guard: guard.clone(),
         },
         rx: TunnelReceiver {
-            reader,
+            stream: StreamSource::Direct(reader),
             noise,
+            frame: Vec::new(),
+            plaintext: Vec::new(),
+            datagrams: None,
             _guard: guard,
         },
-    }
+        e2e: Some((secrets, role)),
+    })
 }
 
 async fn read_handshake_frame(stream: &mut BoxStream) -> Result<Vec<u8>, CircuitError> {
@@ -192,15 +435,20 @@ async fn read_handshake_frame(stream: &mut BoxStream) -> Result<Vec<u8>, Circuit
         .ok_or_else(|| CircuitError::Handshake("stream closed during handshake".into()))
 }
 
-/// Client side of Noise_NK: authenticates the exit by its static key; sends no identity.
-pub async fn client_handshake<S>(stream: S, exit_static: &[u8; 32]) -> Result<Tunnel, CircuitError>
+fn prologue(exit: &PeerId) -> Vec<u8> {
+    [PROLOGUE, &exit.to_bytes()].concat()
+}
+
+/// Client side of Noise_NK: authenticates `exit` by its static key; sends no identity.
+pub async fn client_handshake<S>(stream: S, exit: &PeerId, exit_static: &[u8; 32]) -> Result<Tunnel, CircuitError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream: BoxStream = Box::new(stream);
+    let prologue = prologue(exit);
     let mut noise = snow::Builder::new(NOISE_PARAMS.parse()?)
         .remote_public_key(exit_static)?
-        .prologue(PROLOGUE)?
+        .prologue(&prologue)?
         .build_initiator()?;
     let mut buf = vec![0u8; MAX_FRAME];
 
@@ -215,43 +463,59 @@ where
     if hello.mtu == 0 || hello.mtu > MTU {
         return Err(CircuitError::Handshake("exit offered an invalid MTU".into()));
     }
-    Ok(into_tunnel(stream, noise.into_transport_mode()?, hello, None))
+    into_tunnel(stream, noise, Role::Client, hello, None)
 }
 
-/// Exit side of Noise_NK. `guard` is kept alive for as long as the tunnel exists.
-pub async fn exit_handshake<S>(
+/// Exit side of Noise_NK, as exit `local`. `guard` is kept alive for as long as the
+/// tunnel exists.
+/// Exit side of the handshake. `static_keys` are the keys a client may have from our
+/// record ([`crate::identity::ExitKeys::candidates`]), tried in order.
+pub async fn exit_handshake<S, K>(
     stream: S,
-    static_private: &[u8],
+    local: &PeerId,
+    static_keys: &[K],
     assigned_ip: Ipv4Addr,
     guard: Option<Guard>,
 ) -> Result<Tunnel, CircuitError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    K: AsRef<[u8]>,
 {
     let mut stream: BoxStream = Box::new(stream);
-    let mut noise = snow::Builder::new(NOISE_PARAMS.parse()?)
-        .local_private_key(static_private)?
-        .prologue(PROLOGUE)?
-        .build_responder()?;
+    let prologue = prologue(local);
     let mut buf = vec![0u8; MAX_FRAME];
 
     let first = read_handshake_frame(&mut stream).await?;
-    let n = noise.read_message(&first, &mut buf)?;
+    let mut accepted = None;
+    for key in static_keys {
+        let mut noise = snow::Builder::new(NOISE_PARAMS.parse()?)
+            .local_private_key(key.as_ref())?
+            .prologue(&prologue)?
+            .build_responder()?;
+        // Only the right key decrypts the first message.
+        if let Ok(n) = noise.read_message(&first, &mut buf) {
+            accepted = Some((noise, n));
+            break;
+        }
+    }
+    let (mut noise, n) = accepted.ok_or_else(|| CircuitError::Handshake("the client used none of our keys".into()))?;
     let hello: ClientHello =
         postcard::from_bytes(&buf[..n]).map_err(|_| CircuitError::Handshake("malformed client hello".into()))?;
     if hello.version != PROTOCOL_VERSION {
         return Err(CircuitError::Handshake(format!("unsupported version {}", hello.version)));
     }
 
+    let keys = E2eSecrets::random();
     let hello = ExitHello {
         assigned_ip: assigned_ip.octets(),
         mtu: MTU,
+        datagram_keys: [*keys.client_to_exit, *keys.exit_to_client],
     };
     let payload = postcard::to_stdvec(&hello).expect("serializable");
     let n = noise.write_message(&payload, &mut buf)?;
     write_frame(&mut stream, &buf[..n]).await?;
 
-    Ok(into_tunnel(stream, noise.into_transport_mode()?, hello, guard))
+    into_tunnel(stream, noise, Role::Exit, hello, guard)
 }
 
 /// Client: asks `relay` to splice to `exit`, then runs the Noise_NK handshake through it.
@@ -271,9 +535,11 @@ pub async fn open_via_relay(
             other => CircuitError::RelayUnreachable(addrs::redact(&other.to_string())),
         })?;
 
+    let socket = handle.datagram_socket();
     let request = SpliceRequest {
         exit: exit.to_bytes(),
         addrs: exit_addrs.iter().take(MAX_RECORD_ADDRS).map(|a| a.to_vec()).collect(),
+        datagrams: socket.is_some(),
     };
     write_frame(&mut stream, &postcard::to_stdvec(&request).expect("serializable")).await?;
 
@@ -285,10 +551,31 @@ pub async fn open_via_relay(
         Some([SPLICE_EXIT_UNREACHABLE]) => return Err(CircuitError::ExitUnreachable),
         _ => return Err(CircuitError::RelayRefused),
     }
-
-    timeout(HANDSHAKE_TIMEOUT, client_handshake(stream, exit_static))
+    let offer = timeout(HANDSHAKE_TIMEOUT, read_frame(&mut stream))
         .await
-        .map_err(|_| CircuitError::Timeout)?
+        .map_err(|_| CircuitError::Timeout)??
+        .and_then(|frame| postcard::from_bytes::<Option<Offer>>(&frame).ok())
+        .ok_or(CircuitError::RelayRefused)?;
+
+    let mut tunnel = timeout(HANDSHAKE_TIMEOUT, client_handshake(stream, &exit, exit_static))
+        .await
+        .map_err(|_| CircuitError::Timeout)??;
+    if let (Some(socket), Some(offer)) = (socket, offer)
+        && let Some(ip) = direct_ipv4(handle, relay).await
+    {
+        tunnel.attach_datagrams(&socket, &offer, ip);
+    }
+    Ok(tunnel)
+}
+
+/// The IPv4 address of a direct (not relayed) connection to `peer`: where its datagram
+/// socket is.
+async fn direct_ipv4(handle: &NodeHandle, peer: PeerId) -> Option<Ipv4Addr> {
+    let connected = handle.connected_addrs(peer).await.ok()?;
+    connected.iter().filter(|a| !addrs::is_circuit(a)).find_map(|a| match addrs::ip_of(a) {
+        Some(IpAddr::V4(ip)) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    })
 }
 
 /// Relay: accepts splice requests and pipes them to the requested exit.
@@ -299,14 +586,20 @@ pub(crate) async fn serve_splices(
     allow_private: bool,
 ) {
     let slots = Arc::new(Semaphore::new(MAX_SPLICES));
+    // One peer can't take every splice slot.
+    let per_peer = RelayQuota::new(MAX_SPLICES_PER_PEER);
     while let Some((from, stream)) = incoming.next().await {
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             debug!("splice limit reached; dropping request");
             continue;
         };
+        let Some(ticket) = per_peer.acquire(from) else {
+            debug!("too many splices for one peer; dropping request");
+            continue;
+        };
         let handle = handle.clone();
         tokio::spawn(async move {
-            let _slot = slot;
+            let _slot = (slot, ticket);
             if let Err(e) = splice(&handle, from, stream, rate_mbps, allow_private).await {
                 debug!("splice ended: {e:#}");
             }
@@ -346,7 +639,20 @@ async fn splice(
             anyhow::bail!("exit unreachable");
         }
     };
+    let mut exit_stream = exit_stream;
+    let relayed = match handle.datagram_socket() {
+        Some(socket) if request.datagrams => socket.relay(rate_mbps),
+        _ => None,
+    };
+    let (_relaying, client_offer, exit_offer) = match relayed {
+        Some((guard, a, b)) => (Some(guard), Some(a), Some(b)),
+        None => (None, None, None),
+    };
+    let hello = postcard::to_stdvec(&RelayHello { datagrams: exit_offer }).expect("serializable");
+    write_frame(&mut exit_stream, &hello).await?;
     write_frame(&mut client, &[SPLICE_OK]).await?;
+    write_frame(&mut client, &postcard::to_stdvec(&client_offer).expect("serializable")).await?;
+    // Datagrams are relayed for as long as the streams are.
     pipe(client, exit_stream, rate_mbps).await;
     Ok(())
 }
@@ -403,15 +709,16 @@ pub struct ExitSession {
 
 /// Exit: accepts tunnels, assigns virtual IPs and hands sessions to `sessions`.
 pub(crate) async fn serve_exit(
+    handle: NodeHandle,
     mut incoming: libp2p_stream::IncomingStreams,
-    static_private: Zeroizing<Vec<u8>>,
+    local: PeerId,
+    keys: Arc<ExitKeys>,
     max_sessions: usize,
     pool: IpPool,
     sessions: mpsc::Sender<ExitSession>,
 ) {
     let slots = Arc::new(Semaphore::new(max_sessions));
     let per_relay = RelayQuota::new(per_relay_limit(max_sessions));
-    let static_private = Arc::new(static_private);
     while let Some((via_peer, stream)) = incoming.next().await {
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             debug!("exit session limit reached; dropping request");
@@ -425,13 +732,28 @@ pub(crate) async fn serve_exit(
             debug!("exit address pool exhausted; dropping request");
             continue;
         };
-        let key = static_private.clone();
+        let keys = keys.candidates();
         let sessions = sessions.clone();
+        let handle = handle.clone();
         tokio::spawn(async move {
             let ip = lease.ip;
             let guard: Guard = Arc::new((lease, slot, ticket));
-            match timeout(HANDSHAKE_TIMEOUT, exit_handshake(stream, &key, ip, Some(guard))).await {
-                Ok(Ok(tunnel)) => {
+            let accept = async {
+                let mut stream = stream;
+                let hello = read_frame(&mut stream)
+                    .await?
+                    .and_then(|frame| postcard::from_bytes::<RelayHello>(&frame).ok())
+                    .ok_or_else(|| CircuitError::Handshake("malformed relay hello".into()))?;
+                let tunnel = exit_handshake(stream, &local, &keys, ip, Some(guard)).await?;
+                Ok::<_, CircuitError>((tunnel, hello.datagrams))
+            };
+            match timeout(EXIT_HANDSHAKE_TIMEOUT, accept).await {
+                Ok(Ok((mut tunnel, offer))) => {
+                    if let (Some(socket), Some(offer)) = (handle.datagram_socket(), offer)
+                        && let Some(relay) = direct_ipv4(&handle, via_peer).await
+                    {
+                        tunnel.attach_datagrams(&socket, &offer, relay);
+                    }
                     let _ = sessions.send(ExitSession { via_peer, tunnel }).await;
                 }
                 Ok(Err(e)) => debug!("exit handshake failed: {e}"),
@@ -443,8 +765,10 @@ pub(crate) async fn serve_exit(
 
 /// Sessions allowed through one relay. Exits can't tell clients apart (that's the point),
 /// but they can stop a single relay, and so a single client, from taking every slot.
+/// Half, not less: entry relays are the few dedicated servers, so a tighter share would
+/// leave most of an exit's slots unusable in a small network.
 fn per_relay_limit(max_sessions: usize) -> usize {
-    (max_sessions / 4).max(2)
+    (max_sessions / 2).max(2)
 }
 
 /// Counts sessions per relay; a [`RelayTicket`] gives its place back when dropped.
@@ -554,9 +878,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_first_handshake_message_carries_only_the_version() {
+        // See ClientHello: anything added here would be readable by whoever later gets
+        // the exit's static key, and replayable. Change this test only with that in mind.
+        let hello = postcard::to_stdvec(&ClientHello { version: PROTOCOL_VERSION }).unwrap();
+        assert_eq!(hello, [PROTOCOL_VERSION]);
+    }
+
+    #[test]
     fn one_relay_cannot_take_every_exit_session() {
-        assert_eq!(per_relay_limit(16), 4);
-        assert_eq!(per_relay_limit(64), 16);
+        assert_eq!(per_relay_limit(16), 8);
+        assert_eq!(per_relay_limit(64), 32);
         assert_eq!(per_relay_limit(3), 2, "small exits still allow some sharing of a relay");
 
         let quota = RelayQuota::new(2);

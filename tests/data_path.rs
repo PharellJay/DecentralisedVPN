@@ -13,7 +13,7 @@ use common::{Opts, start, wait_for};
 use dvpn::control::{self, SharedState};
 use dvpn::device::PacketDevice;
 use dvpn::exit::{self, ExitOptions};
-use dvpn::policy::ExitPolicy;
+use dvpn::policy::{ExitPolicy, Ports};
 use tokio::sync::{Mutex, mpsc};
 
 /// One side of an in-memory packet device.
@@ -97,7 +97,7 @@ async fn packets_flow_end_to_end_and_exit_policy_is_enforced() {
     let (exit_device, mut exit_kernel) = fake_device();
     let active = Arc::new(AtomicUsize::new(0));
     let options = Arc::new(ExitOptions {
-        policy: ExitPolicy::new(["198.51.100.0/24".parse().unwrap()], vec![25]),
+        policy: ExitPolicy::new(["198.51.100.0/24".parse().unwrap()], Ports::AllExcept(vec![25])),
         rate_mbps: 0,
     });
     tokio::spawn(exit::forward(exit_device, exit_node.exit_sessions.take().unwrap(), options, active.clone()));
@@ -106,7 +106,9 @@ async fn packets_flow_end_to_end_and_exit_policy_is_enforced() {
     let mut circuit = wait_for("a circuit", || async { client.handle.open_circuit().await.ok() }).await;
     let me = circuit.tunnel.assigned_ip;
     let (client_device, mut client_kernel) = fake_device();
-    tokio::spawn(async move { dvpn::client::pump(client_device.as_ref(), &mut circuit.tunnel).await });
+    let traffic = Arc::new(dvpn::control::Traffic::default());
+    let counted = traffic.clone();
+    tokio::spawn(async move { dvpn::client::pump_counting(client_device.as_ref(), &mut circuit.tunnel, &counted).await });
 
     let web = Ipv4Addr::new(93, 184, 216, 34);
     let allowed = ipv4(me, web, 6, 443, b"hello web");
@@ -134,6 +136,13 @@ async fn packets_flow_end_to_end_and_exit_policy_is_enforced() {
     assert_eq!(next(&mut client_kernel).await.as_deref(), Some(reply.as_slice()));
     assert_eq!(next(&mut client_kernel).await, None);
     assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    // What the app shows: traffic both ways (dropped packets count as sent: they left
+    // this computer), and the latency from the first keepalive.
+    use std::sync::atomic::Ordering::Relaxed;
+    assert!(traffic.sent.load(Relaxed) >= allowed.len() as u64);
+    assert_eq!(traffic.received.load(Relaxed), reply.len() as u64, "only what was delivered");
+    assert!(traffic.rtt_ms().is_some(), "latency measured");
 }
 
 #[tokio::test]

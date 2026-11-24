@@ -181,3 +181,9 @@ label.check input { margin: 0; }
 .log { max-height: 260px; overflow: auto; margin: 0; font-size: 11px; color: var(--muted); }
 
 .notice pre { font-size: 13px; }
+
+.peers { list-style: none; margin: 10px 0; padding: 0; display: grid; gap: 6px; }
+.peers li { display: flex; gap: 10px; align-items: center; }
+.peers code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button.small { padding: 4px 10px; font-size: 12px; }
+h3 { font-size: 14px; margin: 16px 0 4px; }

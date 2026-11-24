@@ -25,6 +25,22 @@ impl TokenBucket {
         Self::new(mbps * 1_000_000 / 8)
     }
 
+    /// Takes `bytes` if they may be sent now; otherwise takes nothing and returns false
+    /// (for packets, which are dropped rather than delayed).
+    pub fn try_take(&mut self, bytes: usize) -> bool {
+        if self.rate == 0.0 {
+            return true;
+        }
+        let now = Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate).min(self.rate);
+        self.last = now;
+        if self.tokens < bytes as f64 {
+            return false;
+        }
+        self.tokens -= bytes as f64;
+        true
+    }
+
     /// Waits until `bytes` may be sent.
     pub async fn take(&mut self, bytes: usize) {
         if self.rate == 0.0 {
@@ -54,6 +70,17 @@ mod tests {
         }
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(1900) && elapsed <= Duration::from_millis(2100), "{elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_take_drops_what_exceeds_the_rate() {
+        let mut bucket = TokenBucket::new(1000);
+        assert!(bucket.try_take(1000), "the burst");
+        assert!(!bucket.try_take(1), "nothing left");
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(bucket.try_take(400));
+        assert!(!bucket.try_take(400));
+        assert!(TokenBucket::new(0).try_take(usize::MAX / 2), "unlimited");
     }
 
     #[tokio::test]

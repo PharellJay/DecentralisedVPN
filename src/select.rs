@@ -140,6 +140,7 @@ async fn open_within(
             continue;
         }
         report.used_user_exits = tier == ExitKind::User;
+        handle.ensure_guard(&relays);
         exits.shuffle(&mut rand::rng());
         exits.truncate(MAX_PROBES);
         let probes = exits.into_iter().map(|exit| probe(handle, exit, relays.clone(), limit, prepare));
@@ -152,6 +153,7 @@ async fn open_within(
         if let Some(i) = pick_within(&measured, limit) {
             // The other test circuits close as they drop.
             let (circuit, rtt) = measured.swap_remove(i);
+            handle.remember_guard(circuit.relay);
             info!("{report}; picked one at random ({} ms)", rtt.as_millis());
             return (Ok(circuit), report);
         }
@@ -172,7 +174,7 @@ async fn probe(
     // Parallel test circuits can race on a fresh connection to the relay ("connection is
     // closed"), so a quick failure gets one retry; a timeout doesn't.
     for attempt in 0..2 {
-        let build = handle.open_circuit_from(vec![exit.clone()], relays.clone(), |p, a| prepare(p, a));
+        let build = handle.build_circuit(vec![exit.clone()], relays.clone(), |p, a| prepare(p, a));
         match timeout(PROBE_BUILD_TIMEOUT, build).await {
             Ok(Ok(built)) => {
                 circuit = Some(built);
@@ -229,7 +231,7 @@ pub struct Measurement {
     pub rtt: Duration,
 }
 
-/// Measures up to [`MAX_PROBES`] exits of each kind through test circuits, which are
+/// Measures up to `MAX_PROBES` exits of each kind through test circuits, which are
 /// closed afterwards. Used to show how many exits fit a limit before connecting.
 pub async fn measure_exits(
     handle: &NodeHandle,
@@ -238,6 +240,7 @@ pub async fn measure_exits(
     prepare: Prepare<'_>,
 ) -> Vec<Measurement> {
     let (dedicated, user) = split_tiers(exits);
+    handle.ensure_guard(&relays);
     let mut sample = Vec::new();
     for mut tier in [dedicated, user] {
         tier.shuffle(&mut rand::rng());

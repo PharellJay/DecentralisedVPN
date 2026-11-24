@@ -1,0 +1,15 @@
+// The dvpn service runs as the system user "dvpn", not root. While connected it
+// points DNS at the tunnel through systemd-resolved (`resolvectl dns/domain/
+// dnsovertls/revert` on its own tunnel device), which only root or polkit may allow.
+// Nothing else is granted, and the user can't log in.
+polkit.addRule(function(action, subject) {
+    var dns = [
+        "org.freedesktop.resolve1.set-dns-servers",
+        "org.freedesktop.resolve1.set-domains",
+        "org.freedesktop.resolve1.set-dns-over-tls",
+        "org.freedesktop.resolve1.revert"
+    ];
+    if (subject.user == "dvpn" && dns.indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+});

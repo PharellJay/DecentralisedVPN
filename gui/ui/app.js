@@ -1,12 +1,14 @@
-// dvpn window: renders the service's state (polled from the Rust side) and sends
-// actions. All networking happens in the dvpn service; this only shows and asks.
+// dvpn window: renders the service's state (pushed by the Rust side, event `update`)
+// and sends actions. All networking happens in the dvpn service; this only shows and asks.
 "use strict";
 
 const { invoke } = window.__TAURI__.core;
-const POLL_MS = 1000;
+const { listen } = window.__TAURI__.event;
+const LOG_LINES = 500;
 const $ = (id) => document.getElementById(id);
 
 let view = null;
+let logLines = [];
 let busy = false; // an action is in flight
 
 function show(screen) {
@@ -24,6 +26,16 @@ function hms(secs) {
 
 const isRandom = (v) => v.selection === "Random";
 
+function bytes(n) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1000 && i < units.length - 1) {
+    n /= 1000;
+    i++;
+  }
+  return `${i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
+}
+
 async function act(action, fields = {}) {
   busy = true;
   render();
@@ -34,7 +46,7 @@ async function act(action, fields = {}) {
     setError(String(e));
   } finally {
     busy = false;
-    await refresh();
+    render(); // the new state is pushed as soon as the service has it
   }
 }
 
@@ -43,13 +55,11 @@ function setError(message) {
   actionError = message;
 }
 
-async function refresh() {
-  let snap;
-  try {
-    snap = await invoke("snapshot");
-  } catch (e) {
-    snap = { state: "error", message: String(e) };
-  }
+// An update from the Rust side: the state, and new log lines (all of them with reset_logs).
+function apply(update) {
+  logLines = update.reset_logs ? update.logs : logLines.concat(update.logs);
+  if (logLines.length > LOG_LINES) logLines = logLines.slice(-LOG_LINES);
+  const snap = update.snapshot;
   switch (snap.state) {
     case "absent":
       view = null;
@@ -73,7 +83,8 @@ async function refresh() {
         show("main");
         render();
       }
-      $("who").textContent = `you ${short(view.peer_id)}`;
+      // The node ID is new every session, so it's only shown while running.
+      $("who").textContent = view.peer_id ? `you ${short(view.peer_id)}` : "";
       break;
   }
 }
@@ -86,17 +97,20 @@ function vpnState(v) {
   switch (vpn.phase) {
     case "Connected": {
       const c = vpn.circuit;
-      const kind = c && c.exit_is_user ? "another user's exit" : "a dedicated exit";
-      return { cls: "on", title: "Connected", sub: c ? `Your traffic leaves from ${kind}` : "" };
+      if (!c) return { cls: "on", title: "Connected", sub: "" };
+      const sub = c.exit_is_user
+        ? "Your traffic leaves from another user's exit, which only carries common services (web, email, chat, SSH)"
+        : "Your traffic leaves from a dedicated exit";
+      return { cls: "on", title: "Connected", sub };
     }
     case "Reconnecting":
       return { cls: "blocked", title: "Reconnecting", sub: "Traffic is blocked until a new connection is up" };
     case "Paused":
       return { cls: "blocked", title: "Paused", sub: "Lending is down, so traffic is blocked until it recovers" };
     case "WaitingForLending":
-      return { cls: "busy", title: "Getting ready", sub: "Waiting for your own exit to be reachable by others" };
+      return { cls: "busy", title: "Getting ready", sub: "Waiting for your own exit to be reachable by others. Traffic is blocked until connected." };
     default:
-      return { cls: "busy", title: "Connecting", sub: "Building a two-hop circuit" };
+      return { cls: "busy", title: "Connecting", sub: "Building a two-hop circuit. Traffic is blocked until connected." };
   }
 }
 
@@ -132,9 +146,14 @@ function render() {
   const c = v.vpn.running ? v.vpn.circuit : null;
   $("circuit-card").hidden = !c;
   if (c) {
-    $("c-ip").textContent = c.assigned_ip;
-    $("c-exit").textContent = `${short(c.exit)} (${c.exit_is_user ? "another user's" : "dedicated"})`;
-    $("c-relay").textContent = short(c.relay);
+    // What websites see: the exit's address. An exit reached only through a relay
+    // doesn't publish it.
+    $("c-ip").textContent = c.exit_ip || "the exit's (not published)";
+    $("c-exit").textContent = c.exit_is_user ? "another user's" : "dedicated";
+    $("c-exit").title = `exit ${c.exit}\nentry relay ${c.relay}\ntunnel address ${c.assigned_ip}`;
+    $("c-rtt").textContent = c.rtt_ms != null ? `${c.rtt_ms} ms` : "measuring…";
+    $("c-data").textContent = `↑ ${bytes(c.bytes_sent)}  ↓ ${bytes(c.bytes_received)} since connecting`;
+    $("c-transport").textContent = c.datagrams ? "UDP datagrams" : "stream (TCP or QUIC)";
     $("c-up").textContent = hms(Math.max(0, Math.floor(Date.now() / 1000) - c.connected_since));
   }
 
@@ -194,11 +213,47 @@ function render() {
     $("network-card").dataset.opened = "1";
   }
 
+  renderBootstrap(v.bootstrap || []);
+  $("invite-box").hidden = !v.invite;
+  if (v.invite && $("invite").value !== v.invite) $("invite").value = v.invite;
+
   // Log
   const log = $("log");
-  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
-  log.textContent = v.logs.join("\n");
-  if (atBottom) log.scrollTop = log.scrollHeight;
+  const text = logLines.join("\n");
+  if (log.textContent !== text) {
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+    log.textContent = text;
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+}
+
+// The connection's age counts up between updates.
+function tick() {
+  const c = view && view.vpn.running ? view.vpn.circuit : null;
+  if (c) $("c-up").textContent = hms(Math.max(0, Math.floor(Date.now() / 1000) - c.connected_since));
+}
+
+function renderBootstrap(peers) {
+  const list = $("bootstrap-list");
+  const key = JSON.stringify(peers) + busy;
+  if (list.dataset.key === key) return; // keeps focus and avoids flicker
+  list.dataset.key = key;
+  list.replaceChildren(
+    ...peers.map((addr) => {
+      const li = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = addr;
+      code.title = addr;
+      const remove = document.createElement("button");
+      remove.className = "secondary small";
+      remove.textContent = "Remove";
+      remove.disabled = busy;
+      remove.addEventListener("click", () => act("remove_bootstrap", { addr }));
+      li.append(code, remove);
+      return li;
+    }),
+  );
+  list.hidden = peers.length === 0;
 }
 
 function availability(v) {
@@ -220,7 +275,10 @@ function setPingLimit(ms) {
 }
 
 function wire() {
-  $("accept").addEventListener("click", () => act("accept_exit_risk"));
+  $("accept").addEventListener("click", async () => {
+    await act("accept_exit_risk");
+    await act("set_lend_at_boot", { enabled: $("consent-boot").checked });
+  });
   $("toggle").addEventListener("click", () => act(view && view.vpn.running ? "disconnect" : "connect"));
   $("lend").addEventListener("click", () => act("lend"));
   $("lend-at-boot").addEventListener("change", (e) => act("set_lend_at_boot", { enabled: e.target.checked }));
@@ -239,11 +297,37 @@ function wire() {
       await invoke("act", { action: { action: "add_bootstrap", addr } });
       $("bootstrap").value = "";
       $("bootstrap-result").textContent = view && view.running
-        ? "Saved. It's used the next time dvpn starts: turn off and connect again."
+        ? "Saved, and dvpn is contacting it now."
         : "Saved. It's used when you lend or connect.";
+      $("bootstrap").placeholder = "dvpn://join?… or /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW…";
     } catch (err) {
       $("bootstrap-result").textContent = String(err);
     }
+  });
+}
+
+// An invite link opened from elsewhere (a browser, a chat): shown for the user to
+// confirm, since a link from a stranger could point at a hostile peer.
+function offerInvite(link) {
+  if (!link) return;
+  $("network-card").open = true;
+  $("network-card").dataset.opened = "1";
+  $("bootstrap").value = link;
+  $("bootstrap-result").textContent = "Opened from an invite link. Add it if you trust whoever sent it.";
+  $("bootstrap").focus();
+}
+
+function wireInvites() {
+  $("copy-invite").addEventListener("click", async () => {
+    const input = $("invite");
+    input.select();
+    try {
+      await navigator.clipboard.writeText(input.value);
+    } catch {
+      document.execCommand("copy");
+    }
+    $("copy-invite").textContent = "Copied";
+    setTimeout(() => ($("copy-invite").textContent = "Copy"), 1500);
   });
 }
 
@@ -251,10 +335,18 @@ async function main() {
   // The terms are wrapped for the terminal; reflow them, keeping paragraphs.
   $("terms").textContent = (await invoke("terms")).replace(/([^\n])\n(?!\n)/g, "$1 ");
   wire();
-  await refresh();
-  setInterval(() => {
-    if (!busy) refresh();
-  }, POLL_MS);
+  wireInvites();
+  await listen("invite", (e) => offerInvite(e.payload));
+  // Listen first, so nothing pushed while the first state loads is missed.
+  let first = null;
+  const early = [];
+  await listen("update", (e) => (first ? apply(e.payload) : early.push(e.payload)));
+  first = await invoke("snapshot");
+  apply(first);
+  // Lines in earlier updates are already in the first state; a reset replaces it.
+  for (const update of early) if (update.reset_logs) apply(update);
+  offerInvite(await invoke("take_invite"));
+  setInterval(tick, 1000);
 }
 
 main();
