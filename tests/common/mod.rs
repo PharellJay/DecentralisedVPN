@@ -30,6 +30,8 @@ pub struct Opts {
     pub listen: bool,
     /// Has a datagram socket (on any free port).
     pub datagrams: bool,
+    /// Meet on this local BitTorrent DHT (`mainline::Testnet::bootstrap`).
+    pub rendezvous: Option<Vec<String>>,
 }
 
 impl Default for Opts {
@@ -42,6 +44,7 @@ impl Default for Opts {
             exit_kind: ExitKind::Dedicated,
             listen: true,
             datagrams: true,
+            rendezvous: None,
         }
     }
 }
@@ -88,6 +91,12 @@ pub async fn start_in(tmp: &Path, opts: Opts) -> TestNode {
             }),
             allow_private_addrs: true,
             datagram_port: opts.datagrams.then_some(0),
+            rendezvous: opts.rendezvous.map(|bootstrap| dvpn::rendezvous::RendezvousConfig {
+                mainline_bootstrap: Some(bootstrap),
+                bind: Some(std::net::Ipv4Addr::LOCALHOST),
+                search_after: Duration::from_secs(1),
+                search_retry: Duration::from_secs(2),
+            }),
         },
     )
     .unwrap();

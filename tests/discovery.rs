@@ -61,3 +61,40 @@ async fn restarted_node_rejoins_from_peer_cache() {
     wait_until_knows(&b, &[a.handle.peer_id()]).await;
     wait_until_knows(&a, &[b.handle.peer_id()]).await;
 }
+
+#[tokio::test]
+async fn a_node_with_no_peers_finds_a_lending_node_on_the_bittorrent_dht() {
+    // A local stand-in for the BitTorrent DHT; nobody gets a bootstrap peer.
+    let testnet = mainline::Testnet::builder(10).build().unwrap();
+    let lender = start(Opts {
+        exit: true,
+        rendezvous: Some(testnet.bootstrap.clone()),
+        ..Default::default()
+    })
+    .await;
+    let newcomer = start(Opts {
+        listen: false,
+        rendezvous: Some(testnet.bootstrap.clone()),
+        ..Default::default()
+    })
+    .await;
+    wait_until_knows(&newcomer, &[lender.handle.peer_id()]).await;
+}
+
+#[tokio::test]
+async fn a_node_that_doesnt_lend_isnt_announced() {
+    let testnet = mainline::Testnet::builder(10).build().unwrap();
+    let _relay_only = start(Opts {
+        rendezvous: Some(testnet.bootstrap.clone()),
+        ..Default::default()
+    })
+    .await;
+    let newcomer = start(Opts {
+        listen: false,
+        rendezvous: Some(testnet.bootstrap.clone()),
+        ..Default::default()
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    assert!(newcomer.handle.routing_peers().await.unwrap().is_empty());
+}

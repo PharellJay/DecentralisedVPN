@@ -31,7 +31,9 @@ use crate::dns::DnsOverTls;
 use crate::platform::tunnel::RouteGuard;
 use crate::select::{self, Prepare};
 
-const PEER_WAIT: Duration = Duration::from_secs(30);
+/// Long enough for a search on the BitTorrent DHT (crate::rendezvous) when the peer
+/// cache and bootstrap peers give nothing.
+const PEER_WAIT: Duration = Duration::from_secs(60);
 const DISCOVERY_WAIT: Duration = Duration::from_secs(60);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -232,7 +234,10 @@ async fn wait_for_peers(handle: &NodeHandle) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + PEER_WAIT;
     while handle.routing_peers().await?.is_empty() {
         if tokio::time::Instant::now() > deadline {
-            bail!("could not reach any other peer; add an invite link or a bootstrap peer from someone already in the network");
+            bail!(
+                "no peers to start from: dvpn found no one reachable yet, and keeps looking. \
+                 Add an invite link or a bootstrap peer under Bootstrap peers to get in now"
+            );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

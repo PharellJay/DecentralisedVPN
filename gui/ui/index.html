@@ -105,6 +105,13 @@
 
     <details class="card" id="network-card">
       <summary><h2>Bootstrap peers</h2></summary>
+      <div class="banner warn" id="no-peers-hint" hidden>
+        <strong>No peers to start from.</strong> There's no central server, so dvpn needs one
+        peer it can reach. <span id="no-peers-searching">It keeps looking on the BitTorrent DHT,
+        where reachable dvpn users announce themselves, but found no one yet.</span> To get in
+        now, ask someone who uses dvpn for their invite link (under <em>Invite someone</em> in
+        their app), or add the address of a server your group runs. You only need to do this once.
+      </div>
       <p class="hint">The first time, dvpn needs one peer it can reach: an invite link from someone who already uses dvpn, or a peer address ending in <code>/p2p/&lt;peer-id&gt;</code> from whoever runs a server for your group. After that it remembers the peers it found.</p>
       <ul class="peers" id="bootstrap-list"></ul>
       <form class="row" id="bootstrap-form">
@@ -112,6 +119,11 @@
         <button class="secondary" type="submit">Add</button>
       </form>
       <p class="hint" id="bootstrap-result"></p>
+      <label class="check"><input type="checkbox" id="rendezvous"> Find peers automatically</label>
+      <p class="hint">Looks for dvpn users on the BitTorrent DHT, a public network run by
+        BitTorrent apps, when no saved peer answers. While lending and reachable, this computer
+        is listed there too; its address is already public as an exit. Applies from the next
+        start.</p>
       <div id="invite-box" hidden>
         <h3>Invite someone</h3>
         <p class="hint">Send this link to someone you want to bring in. It holds the servers you use (not your own address), so it keeps working after dvpn restarts.</p>

@@ -127,6 +127,9 @@ pub struct NodeConfig {
     /// UDP port for circuits' datagram path ([`crate::datagram`]; 0: any free port);
     /// `None` carries packets over streams only.
     pub datagram_port: Option<u16>,
+    /// Find a first peer on the BitTorrent DHT, and announce there while lending
+    /// ([`crate::rendezvous`]); `None` turns that off.
+    pub rendezvous: Option<crate::rendezvous::RendezvousConfig>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -234,6 +237,7 @@ enum Command {
     GetProviders(kad::RecordKey, Reply<HashSet<PeerId>>),
     GetRecords(kad::RecordKey, Reply<Vec<kad::Record>>),
     AddPeer(PeerId, Multiaddr, Reply<()>),
+    DialUnknown(Vec<Multiaddr>, Reply<()>),
     RelayAddrs(Reply<Vec<Multiaddr>>),
     Shutdown(Reply<()>),
 }
@@ -458,6 +462,12 @@ impl NodeHandle {
         self.request(|r| Command::AddPeer(peer, transport, r)).await
     }
 
+    /// Dials addresses whose peer ID we don't know yet (from [`crate::rendezvous`]).
+    /// Peers that turn out to speak dvpn's Kademlia join the routing table (identify).
+    pub async fn dial_unknown(&self, addrs: Vec<Multiaddr>) -> anyhow::Result<()> {
+        self.request(|r| Command::DialUnknown(addrs, r)).await
+    }
+
     /// The first usable relay for `exit`, trying `first` before `relays`, never `avoid`.
     async fn choose_relay(
         &self,
@@ -560,6 +570,10 @@ pub fn spawn(identity: Identity, config: NodeConfig) -> anyhow::Result<Node> {
             config.relay_rate_mbps,
             config.allow_private_addrs,
         ));
+    }
+    if let Some(rendezvous) = config.rendezvous.clone() {
+        let lending = config.exit.as_ref().map(|e| e.kind);
+        tokio::spawn(crate::rendezvous::run(handle.clone(), rendezvous, lending, config.allow_private_addrs));
     }
     let (exit_sessions, exit_pool) = match &config.exit {
         Some(exit) => {
@@ -818,6 +832,14 @@ impl Driver {
                 }
                 let _ = reply.send(());
             }
+            Command::DialUnknown(addrs, reply) => {
+                for addr in addrs {
+                    if let Err(e) = self.swarm.dial(DialOpts::unknown_peer_id().address(addr).build()) {
+                        debug!("dialling a peer from the BitTorrent DHT: {}", addrs::redact(&e.to_string()));
+                    }
+                }
+                let _ = reply.send(());
+            }
             Command::Shutdown(_) => unreachable!("handled in run"),
         }
     }
@@ -901,8 +923,13 @@ impl Driver {
                     // make others dial their own machines and networks.
                     let allow_private = self.config.allow_private_addrs;
                     let usable = info.listen_addrs.iter().filter(|a| addrs::is_dialable_for_others(a, allow_private));
+                    let was_alone = self.routing_table().is_empty();
                     for addr in usable.take(MAX_IDENTIFY_ADDRS) {
                         self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                    }
+                    // Our first peer (e.g. one dialled from the BitTorrent DHT): learn the rest from it.
+                    if was_alone && !self.routing_table().is_empty() {
+                        let _ = self.swarm.behaviour_mut().kad.bootstrap();
                     }
                 }
                 if info.protocols.contains(&relay::HOP_PROTOCOL_NAME) {

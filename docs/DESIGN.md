@@ -36,6 +36,7 @@ traffic. There is no central server, account, or authority.
 | **Global passive observer** | Can correlate entry and exit traffic by timing → deanonymize. | Contents of TLS traffic. |
 | **Sybil attacker** (runs many nodes) | Raises the probability of controlling both hops of a circuit; can poison/eclipse DHT lookups. | Cannot forge another node's signed records. |
 | **Compromised bootstrap peer** | Learns the IP of nodes that bootstrap through it; can feed them a malicious peer set (eclipse). | Has no special authority: it's an ordinary peer. |
+| **BitTorrent DHT nodes near the rendezvous keys** (§3.2) | See which IPs look up or announce dvpn's keys; can answer lookups with only their own nodes (eclipse of a newcomer). | Can't impersonate dvpn peers: a found address is only a first contact, authenticated by libp2p and then replaced by dvpn's own DHT. |
 | **Malicious client (towards exits)** | Uses the exit's IP for abuse. Could try to reach the exit's LAN or spoof source IPs. | Blocked from private ranges and spoofing by exit policy (§3.6). |
 
 ### Honest limitations
@@ -46,7 +47,7 @@ traffic. There is no central server, account, or authority.
 | Exit operators are legally exposed: abuse traffic appears to come from their IP. | Exit is opt-in only, with a warning at enable time; restrictive default exit policy (no SMTP, no private ranges); per-circuit rate limits. | **Partially mitigated**. The operator still carries liability; the software cannot remove it. |
 | Timing correlation (colluding entry+exit or global observer). | Message size padding to fixed buckets; guard persistence reduces exposure over time. No cover traffic in MVP. | **Unmitigated** against a capable adversary |
 | Sybil / eclipse attacks on discovery. | Disjoint Kademlia query paths, /16 subnet diversity between hops, signed records, guard persistence, multiple bootstrap sources. | **Partially mitigated**. A well-resourced attacker can still win. No decentralised system fully solves this without a cost or identity mechanism. |
-| First-ever join needs one known peer address (or a LAN peer). | Invite links (`dvpn://join?peer=…`, §3.2) that any user can copy from the app and send, `--bootstrap` flag, config file, cached peers from previous runs, mDNS with `--mdns`. No list is built in: there's no authority to run it. | **Inherent** to any serverless network |
+| First-ever join needs one reachable peer. | Rendezvous on the BitTorrent DHT (§3.2): lending nodes that others can reach announce themselves there, and a node with no peers looks them up. Also invite links (`dvpn://join?peer=…`) that any user can copy from the app and send, `--bootstrap`, the config file, cached peers from previous runs, mDNS with `--mdns`. No list is built in: there's no authority to run it. | **Mitigated**. It still needs at least one reachable lending node somewhere, and depends on the BitTorrent DHT being reachable (some networks block it) |
 | A stable node ID would let peers, relays and DHT observers recognise a computer across days and networks. | Users' nodes (`connect`, the service) use a new identity every session: on every start, restart, network change and change of public address (§3.1). mDNS, which announces the node to its LAN, is off unless `--mdns` is given. | **Mitigated**. The guard relay is kept across sessions on purpose (§3.3), so it can still link the networks a user connects from. |
 | 2 hops: a colluding entry+exit pair deanonymizes. | 3-hop circuits are planned for later. | **Unmitigated** in MVP |
 | Entry relay learns the client uses the network. | None in MVP (no bridges/obfuscation). | **Unmitigated** |
@@ -90,7 +91,7 @@ traffic. There is no central server, account, or authority.
 
 Layers:
 1. **Transport** (libp2p): TCP + QUIC, Noise XX encryption, Yamux multiplexing.
-2. **Discovery**: Kademlia DHT + mDNS + bootstrap list + peer cache.
+2. **Discovery**: Kademlia DHT + mDNS + bootstrap list + peer cache + rendezvous on the BitTorrent DHT.
 3. **Reachability**: AutoNAT, DCUtR hole punching, Circuit Relay v2 fallback.
 4. **Circuits**: a splice through R, with an end-to-end Noise_NK session to E.
 5. **Tunnel**: TUN device on the client; TUN + NAT + policy on the exit.
@@ -134,6 +135,37 @@ Layers:
   registers the `dvpn` scheme, so clicking a link opens the app with the link filled
   in; it is added only when the user confirms, since a stranger's link could lead to
   peers that show a newcomer a false view of the network.
+- **Rendezvous on the BitTorrent DHT** (`src/rendezvous.rs`), for a first contact without
+  any server of ours. It borrows the BitTorrent Mainline DHT, which millions of
+  BitTorrent clients keep running (BEP 5), through the `mainline` crate.
+  - *Keys.* `BLAKE2s("dvpn/rendezvous/v1/<shard>/<day>")` cut to 20 bytes, for 4 shards
+    and the UTC day. They're opaque keys, not torrents.
+  - *Searching.* A node whose routing table is still empty 10 s after starting (no peer
+    cache, bootstrap peer or invite link worked) looks up today's and yesterday's keys.
+    It dials up to 16 of the IP:port pairs it finds, over TCP and QUIC, without a peer
+    ID. A peer that speaks dvpn's Kademlia joins the routing table (identify), and the
+    node bootstraps from it. While nobody is found it searches again after 30 s,
+    doubling up to 5 minutes. Connecting waits up to 60 s for a first peer.
+  - *Announcing.* Only lending nodes announce, every 15 minutes, with their TCP listen
+    port, in their own shard. They must be reachable: AutoNAT says so, or the public
+    IP the DHT sees is on one of their own interfaces (a node alone in the network has
+    nobody to run AutoNAT with). A user's node must also see the DHT report its real
+    IP: on its own interface, or the one two dvpn peers confirmed. While connected, the
+    DHT would see its exit's IP instead. A dedicated exit (`run --exit`) skips that
+    check, since it never routes its own traffic through a tunnel.
+  - *Privacy.* A lending node's IP is already public in its exit record (§1, "anyone can
+    list dvpn users"), so announcing it adds no new exposure. A node that isn't lending
+    never announces. Searching shows the node's IP to the few DHT nodes asked.
+  - *Footprint.* Each search or announcement is a short-lived DHT client with a fresh
+    node ID, closed when done. It never runs long enough for the library's adaptive
+    mode to start serving the DHT (15 minutes), so dvpn nodes never store or serve
+    strangers' torrent lists.
+  - *Eclipse.* Nodes placed next to the keys could answer with only their own peers.
+    The daily key change and the shards make that cost more, and dvpn's own DHT
+    (disjoint paths, signed records) replaces the first contact at once. It's the same
+    risk as a malicious bootstrap peer.
+  - *Off switch.* "Find peers automatically" in the app (`config.json`
+    `"rendezvous": false`), or `--no-rendezvous`.
 - **Peer cache**: known-good peer addresses are saved locally (`0600`) so later runs need
   no bootstrap. Can be disabled with `--no-peer-cache`. Each save replaces it with the
   peers known now; if dvpn doesn't run for 30 days, its entries expire and the file is

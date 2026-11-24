@@ -210,7 +210,14 @@ function render() {
   $("off").disabled = busy;
 
   // With nobody to talk to, the bootstrap peer is what's needed.
-  if (v.running && v.routing_peers === 0 && !$("network-card").dataset.opened) {
+  const failedForPeers = [v.error, v.vpn.last_error].some((e) => e && e.includes("no peers to start from"));
+  // Not just "running with no peers": that's also true for the first seconds of every start.
+  const noPeers = v.routing_peers === 0 && (failedForPeers || (v.running && !(v.bootstrap || []).length));
+  $("no-peers-hint").hidden = !noPeers;
+  $("no-peers-searching").hidden = !v.rendezvous;
+  $("rendezvous").checked = v.rendezvous;
+  $("rendezvous").disabled = busy;
+  if (noPeers && !$("network-card").dataset.opened) {
     $("network-card").open = true;
     $("network-card").dataset.opened = "1";
   }
@@ -287,6 +294,7 @@ function wire() {
   $("toggle").addEventListener("click", () => act(view && view.vpn.running ? "disconnect" : "connect"));
   $("lend").addEventListener("click", () => act("lend"));
   $("lend-at-boot").addEventListener("change", (e) => act("set_lend_at_boot", { enabled: e.target.checked }));
+  $("rendezvous").addEventListener("change", (e) => act("set_rendezvous", { enabled: e.target.checked }));
   $("off").addEventListener("click", () => act("stop"));
   $("measure").addEventListener("click", () => act("measure"));
   $("mode-random").addEventListener("click", () => act("set_selection", { max_ping_ms: null }));

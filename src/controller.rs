@@ -106,6 +106,9 @@ pub enum Action {
     /// Whether the service starts lending when it starts (at boot). Saved in
     /// `config.json`; doesn't start or stop anything now.
     SetLendAtBoot { enabled: bool },
+    /// Whether to find peers on the BitTorrent DHT ([`crate::rendezvous`]). Saved in
+    /// `config.json`; applies from the next start.
+    SetRendezvous { enabled: bool },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -140,6 +143,9 @@ pub struct View {
     pub consent_given: bool,
     /// The service starts lending when it starts (see [`Action::SetLendAtBoot`]).
     pub lend_at_boot: bool,
+    /// Peers are found on the BitTorrent DHT (see [`Action::SetRendezvous`]).
+    #[serde(default)]
+    pub rendezvous: bool,
     /// The bootstrap peers saved in `config.json`.
     #[serde(default)]
     pub bootstrap: Vec<String>,
@@ -324,6 +330,7 @@ impl Controller {
             Action::AddBootstrap { addr } => self.add_bootstrap(&addr).await?,
             Action::RemoveBootstrap { addr } => self.remove_bootstrap(&addr)?,
             Action::SetLendAtBoot { enabled } => self.set_lend_at_boot(enabled)?,
+            Action::SetRendezvous { enabled } => self.set_rendezvous(enabled)?,
         }
         Ok(())
     }
@@ -516,6 +523,16 @@ impl Controller {
         Ok(())
     }
 
+    fn set_rendezvous(&self, enabled: bool) -> anyhow::Result<()> {
+        let mut file = FileConfig::load(&self.data_dir)?;
+        if file.rendezvous != enabled {
+            file.rendezvous = enabled;
+            file.save(&self.data_dir)?;
+        }
+        info!("finding peers on the BitTorrent DHT is {} from the next start", if enabled { "on" } else { "off" });
+        Ok(())
+    }
+
     fn set_lend_at_boot(&mut self, enabled: bool) -> anyhow::Result<()> {
         if enabled && !self.consent_given() {
             bail!("the lending terms haven't been accepted yet");
@@ -630,6 +647,7 @@ impl Controller {
             peer_id: String::new(),
             consent_given: lend::consent_given(&self.data_dir),
             lend_at_boot: self.lend_at_boot,
+            rendezvous: FileConfig::load(&self.data_dir).is_ok_and(|c| c.rendezvous),
             bootstrap: FileConfig::load(&self.data_dir).map(|c| c.bootstrap).unwrap_or_default(),
             invite: None,
             running: false,

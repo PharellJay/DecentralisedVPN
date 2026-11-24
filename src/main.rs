@@ -16,6 +16,7 @@ use dvpn::lend::{self, LendOptions, Lending};
 use dvpn::logs::LogBuffer;
 use dvpn::node::{self, ExitConfig, Node, NodeConfig, Reachability};
 use dvpn::policy::{DEFAULT_BLOCKED_TCP_PORTS, Ports};
+use dvpn::rendezvous::RendezvousConfig;
 use dvpn::records::ExitKind;
 use dvpn::dns::DnsOverTls;
 use dvpn::platform::service::shutdown_signal;
@@ -68,6 +69,10 @@ struct NetworkArgs {
     /// Carry circuits' packets over streams only (no UDP datagram path)
     #[arg(long)]
     no_datagrams: bool,
+    /// Don't look for a first peer on the BitTorrent DHT, nor announce this node there
+    /// while lending. Also off when config.json has "rendezvous": false
+    #[arg(long)]
+    no_rendezvous: bool,
 }
 
 /// Settings for lending your IP as an exit.
@@ -186,9 +191,9 @@ async fn main() -> anyhow::Result<()> {
     // netlink_packet_route warns on every interface poll (every 10 s) when the kernel is
     // newer than the crate, about IPv6 attributes dvpn never reads.
     let filter = if cli.debug {
-        "dvpn=debug,libp2p_kad=error,netlink_packet_route=error,warn"
+        "dvpn=debug,libp2p_kad=error,netlink_packet_route=error,mainline=error,warn"
     } else {
-        "dvpn=info,libp2p_kad=error,netlink_packet_route=error,warn"
+        "dvpn=info,libp2p_kad=error,netlink_packet_route=error,mainline=error,warn"
     };
     // The service keeps recent lines in memory for the app. The journal is written to
     // disk, so it only gets warnings: info lines tell when the VPN was used and through
@@ -201,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_ansi(false)
                 .without_time()
                 .with_filter(EnvFilter::new(filter));
-            let journal_filter = if cli.debug { filter } else { "warn,libp2p_kad=error,netlink_packet_route=error" };
+            let journal_filter = if cli.debug { filter } else { "warn,libp2p_kad=error,netlink_packet_route=error,mainline=error" };
             let journal = tracing_subscriber::fmt::layer()
                 .with_ansi(std::io::stdout().is_terminal())
                 .with_filter(EnvFilter::new(journal_filter));
@@ -451,7 +456,9 @@ async fn start_session(data_dir: &Path, args: ConnectArgs, status_socket: bool) 
 /// Settings shared by `run` and `connect`.
 fn network_config(data_dir: &Path, net: NetworkArgs) -> anyhow::Result<NodeConfig> {
     let mut bootstrap = net.bootstrap;
-    for addr in FileConfig::load(data_dir)?.bootstrap {
+    let file = FileConfig::load(data_dir)?;
+    let rendezvous = (!net.no_rendezvous && file.rendezvous).then(RendezvousConfig::default);
+    for addr in file.bootstrap {
         bootstrap.push(addr.parse().with_context(|| format!("invalid bootstrap address {addr} in config.json"))?);
     }
     Ok(NodeConfig {
@@ -466,6 +473,7 @@ fn network_config(data_dir: &Path, net: NetworkArgs) -> anyhow::Result<NodeConfi
         exit: None,
         allow_private_addrs: net.allow_private_addrs,
         datagram_port: (!net.no_datagrams).then_some(net.datagram_port),
+        rendezvous,
     })
 }
 

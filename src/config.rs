@@ -27,11 +27,18 @@ pub struct FileConfig {
     /// The service (`dvpn daemon`) starts lending when it starts, i.e. at boot.
     /// On unless the user turns it off; it still waits for the lending terms.
     pub lend_at_boot: bool,
+    /// Find a first peer on the BitTorrent DHT, and announce there while lending
+    /// (`crate::rendezvous`). On unless the user turns it off.
+    pub rendezvous: bool,
 }
 
 impl Default for FileConfig {
     fn default() -> Self {
-        Self { bootstrap: Vec::new(), lend_at_boot: true }
+        Self {
+            bootstrap: Vec::new(),
+            lend_at_boot: true,
+            rendezvous: true,
+        }
     }
 }
 

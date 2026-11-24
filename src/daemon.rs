@@ -159,6 +159,8 @@ fn action_name(action: &Action) -> &'static str {
         Action::RemoveBootstrap { .. } => "remove a bootstrap peer",
         Action::SetLendAtBoot { enabled: true } => "lend at boot",
         Action::SetLendAtBoot { enabled: false } => "don't lend at boot",
+        Action::SetRendezvous { enabled: true } => "find peers automatically",
+        Action::SetRendezvous { enabled: false } => "don't find peers automatically",
     }
 }
 

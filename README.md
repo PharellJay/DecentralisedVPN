@@ -80,8 +80,11 @@ The `dvpn` user and group remain. They own no files and can't sign in, but
 ## Use it
 
 - The first time, the app shows what lending means and asks you to accept.
-- Add a bootstrap peer under **Bootstrap peer**, then press **Connect**. Peers are
-  remembered after the first successful join, so this is needed only once.
+- Press **Connect**. With no peers yet, dvpn looks for other users on the BitTorrent DHT,
+  where reachable lending users announce themselves (**Find peers automatically**, on by
+  default; see [DESIGN.md §3.2](docs/DESIGN.md)). If it finds no one, add an invite link or
+  a bootstrap peer under **Bootstrap peers**. Peers are remembered after the first
+  successful join, so this is needed only once.
 - To help the network without using the VPN yourself, press **Start lending** under
   **Lending** (or **Lend without connecting** in the tray menu). **Start lending when
   this computer starts** is ticked by default, so once you've accepted the terms dvpn
@@ -191,6 +194,12 @@ sudo dvpn run --exit --accept-exit-risk         # a dedicated exit (--wan <if> i
 dvpn status                                     # the running node's state, as JSON
 ```
 
+A dedicated exit announces itself on the BitTorrent DHT once reachable, so new users
+find it without a bootstrap address. A relay that doesn't lend isn't announced, so hand
+out its address or an invite link. `--no-rendezvous` turns this off. Behind 1:1 NAT
+(e.g. a cloud VM whose public IP isn't on its interface), add `--reachability public`
+so the exit doesn't wait for AutoNAT to confirm it's reachable.
+
 A node run under `sudo` uses root's own identity, in `/root/.local/share/dvpn` unless
 you pass `--data-dir`. A dedicated exit sets up IPv4 forwarding, NAT and the forwarding
 restrictions itself, and removes them on exit (`sudo scripts/exit-teardown.sh` if it
@@ -236,7 +245,7 @@ sudo scripts/netns-test.sh       # real TUN, routes and NAT in throwaway namespa
 
 | Test | What it starts | What it checks |
 |---|---|---|
-| `tests/discovery.rs` | real nodes on localhost | DHT discovery and rejoining from the peer cache |
+| `tests/discovery.rs` | real nodes on localhost, and a local BitTorrent DHT | DHT discovery, rejoining from the peer cache, finding a lending node through the rendezvous and not announcing nodes that don't lend |
 | `tests/circuits.rs` | real nodes on localhost | end-to-end 2-hop circuits; the switch to datagrams, and staying on the stream through a relay without them; refusal by non-exit and non-relay nodes |
 | `tests/nat.rs` | real nodes on localhost | AutoNAT, relay reservations, an exit behind NAT |
 | `tests/tunnel_crypto.rs` | a client and exit joined by an in-memory relay | the relay can't read, tamper with or replay traffic; an impostor exit is rejected |

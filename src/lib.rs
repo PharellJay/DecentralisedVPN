@@ -22,4 +22,5 @@ pub mod platform;
 pub mod policy;
 pub mod ratelimit;
 pub mod records;
+pub mod rendezvous;
 pub mod select;
