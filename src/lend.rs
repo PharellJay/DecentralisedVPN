@@ -54,6 +54,7 @@ your home network or this computer. dvpn keeps no logs of what passes through.
 
 If someone misuses your connection, complaints may reach you first, because it's your
 IP address. Some internet providers' terms don't allow sharing your connection.";
+/// The packages' postinst deletes it, so every install or upgrade asks again.
 const CONSENT_FILE: &str = "exit-risk-accepted";
 
 /// Whether the user has accepted [`LENDING_WARNING`] for this data directory.

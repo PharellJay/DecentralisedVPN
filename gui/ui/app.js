@@ -78,6 +78,8 @@ function apply(update) {
     case "ready":
       view = snap.view;
       if (!view.consent_given) {
+        // Shown again after every install or upgrade: keep the choice made last time.
+        if ($("screen-consent").hidden) $("consent-boot").checked = view.lend_at_boot;
         show("consent");
       } else {
         show("main");
@@ -276,8 +278,11 @@ function setPingLimit(ms) {
 
 function wire() {
   $("accept").addEventListener("click", async () => {
+    // Lending at boot starts as soon as the terms are accepted, so turn it off first.
+    const atBoot = $("consent-boot").checked;
+    if (!atBoot) await act("set_lend_at_boot", { enabled: false });
     await act("accept_exit_risk");
-    await act("set_lend_at_boot", { enabled: $("consent-boot").checked });
+    if (atBoot) await act("set_lend_at_boot", { enabled: true });
   });
   $("toggle").addEventListener("click", () => act(view && view.vpn.running ? "disconnect" : "connect"));
   $("lend").addEventListener("click", () => act("lend"));

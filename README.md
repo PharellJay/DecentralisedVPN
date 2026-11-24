@@ -38,6 +38,45 @@ SSH, an administrator can run `sudo usermod -aG dvpn <user>`; that applies at on
 without logging out. Older versions could install a `dvpn` command to
 `/usr/local/bin`; if you did that, remove it with `sudo rm /usr/local/bin/dvpn`.
 
+## Update
+
+Get the new source, then build and install both packages again. Settings, bootstrap
+peers and the node's keys in `/var/lib/dvpn` are kept.
+
+```sh
+git pull
+cargo deb && cargo deb -p dvpn-gui
+sudo apt install ./target/debian/dvpn_*.deb ./target/debian/dvpn-gui_*.deb
+```
+
+- If `target/debian` still holds older packages, the wildcard picks those up too.
+  Delete them first, or name the new version's files.
+- Rebuilding without a version change? Use `sudo apt reinstall` with the same files,
+  since `apt install` skips a version that's already installed.
+- The service restarts by itself during the update, which disconnects you if you're
+  connected. Quit and reopen the app (tray icon → Quit) so the new app runs too.
+- After every install, update or reinstall, the app shows the lending terms again.
+  Nothing lends until you accept them. If lending at boot is on, it starts as soon as
+  you accept, and your earlier choice is kept.
+
+## Uninstall
+
+```sh
+sudo apt remove dvpn-gui dvpn
+```
+
+This stops the service and removes the app, and with it any firewall rules or routes
+a crashed connection left behind. The node's keys and settings in `/var/lib/dvpn`
+stay, so reinstalling continues where you left off. To delete those too:
+
+```sh
+sudo apt purge dvpn-gui dvpn
+rm -rf ~/.local/share/dev.dvpn.desktop   # the app's window data, for each user
+```
+
+The `dvpn` user and group remain. They own no files and can't sign in, but
+`sudo userdel dvpn; sudo groupdel dvpn` removes them if you want them gone.
+
 ## Use it
 
 - The first time, the app shows what lending means and asks you to accept.
@@ -131,7 +170,8 @@ network-administration rights, not as root; the app is its client and needs no s
 
 To give another account control (e.g. over SSH): `sudo usermod -aG dvpn <user>`. It
 applies right away.
-Removing the packages keeps the node's keys; `sudo apt purge dvpn` deletes them.
+Removing the packages keeps the node's keys; `sudo apt purge dvpn` deletes them (see
+[Uninstall](#uninstall)).
 
 ### Behind NAT
 

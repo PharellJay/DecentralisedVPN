@@ -183,7 +183,13 @@ async fn main() -> anyhow::Result<()> {
     let command = cli.command;
     // Third-party crates stay at `warn` even with --debug, since their debug output includes addresses.
     // libp2p_kad warns on every first start with an empty routing table, which is expected.
-    let filter = if cli.debug { "dvpn=debug,libp2p_kad=error,warn" } else { "dvpn=info,libp2p_kad=error,warn" };
+    // netlink_packet_route warns on every interface poll (every 10 s) when the kernel is
+    // newer than the crate, about IPv6 attributes dvpn never reads.
+    let filter = if cli.debug {
+        "dvpn=debug,libp2p_kad=error,netlink_packet_route=error,warn"
+    } else {
+        "dvpn=info,libp2p_kad=error,netlink_packet_route=error,warn"
+    };
     // The service keeps recent lines in memory for the app. The journal is written to
     // disk, so it only gets warnings: info lines tell when the VPN was used and through
     // which peers, which shouldn't outlive the session (--debug sends everything).
@@ -195,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_ansi(false)
                 .without_time()
                 .with_filter(EnvFilter::new(filter));
-            let journal_filter = if cli.debug { filter } else { "warn,libp2p_kad=error" };
+            let journal_filter = if cli.debug { filter } else { "warn,libp2p_kad=error,netlink_packet_route=error" };
             let journal = tracing_subscriber::fmt::layer()
                 .with_ansi(std::io::stdout().is_terminal())
                 .with_filter(EnvFilter::new(journal_filter));

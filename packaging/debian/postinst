@@ -26,6 +26,11 @@ if [ "$1" = "configure" ]; then
     fi
     # Nothing else to set up: whoever is signed in at this computer can use the dvpn app
     # (polkit), and group membership applies at once, without logging out.
+
+    # Every install, upgrade or reinstall asks for the lending terms again (the file is
+    # CONSENT_FILE in src/lend.rs). Nothing lends until they're accepted in the app; then
+    # lending at boot, if it's on, picks up again without a restart.
+    rm -f /var/lib/dvpn/exit-risk-accepted
 fi
 
 #DEBHELPER#

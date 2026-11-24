@@ -51,6 +51,7 @@ pub async fn run(mut controller: Controller, listener: Listener, shutdown: impl 
     let server = tokio::spawn(control::serve_with(listener, handler, Some(authorize), Some(feed.clone())));
     // When to (re)start lending by itself; `None` once the user turns it off.
     let mut lend_at = controller.lend_at_boot().then(Instant::now);
+    let mut told_waiting = false;
     match lend_at {
         Some(_) => info!("dvpn service ready; lending at boot is on"),
         None => info!("dvpn service ready; idle until a client asks it to lend or connect"),
@@ -76,7 +77,7 @@ pub async fn run(mut controller: Controller, listener: Listener, shutdown: impl 
             }
             _ = poll.tick() => {
                 controller.poll().await;
-                keep_lending(&mut controller, &mut lend_at).await;
+                keep_lending(&mut controller, &mut lend_at, &mut told_waiting).await;
                 refresh(&controller, &feed).await;
             }
             () = &mut shutdown => break,
@@ -97,8 +98,9 @@ async fn refresh(controller: &Controller, feed: &Feed) {
 }
 
 /// With lending at boot on, starts lending, and starts it again if it fails (the network
-/// may not be up yet at boot) or the node stops later.
-async fn keep_lending(controller: &mut Controller, lend_at: &mut Option<Instant>) {
+/// may not be up yet at boot) or the node stops later. Until the lending terms are
+/// accepted (after every install or upgrade) it waits, then starts once they are.
+async fn keep_lending(controller: &mut Controller, lend_at: &mut Option<Instant>, told_waiting: &mut bool) {
     let Some(at) = *lend_at else {
         return;
     };
@@ -106,8 +108,10 @@ async fn keep_lending(controller: &mut Controller, lend_at: &mut Option<Instant>
         return;
     }
     if !controller.consent_given() {
-        info!("lending at boot waits until the lending terms are accepted");
-        *lend_at = None;
+        if !*told_waiting {
+            info!("lending at boot waits until the lending terms are accepted");
+            *told_waiting = true;
+        }
         return;
     }
     match controller.start().await {
